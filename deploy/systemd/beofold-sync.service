@@ -1,0 +1,44 @@
+# /etc/systemd/system/beofold-sync.service
+# BeoFold Mode A Persistent axum Web Synchronizing Daemon (behind Apache mod_proxy_http)
+# Documentation: https://www.freedesktop.org/software/systemd/man/systemd.exec.html
+
+[Unit]
+Description=BeoFold Multi-Cluster Web Synchronizing Server (Apache Reverse-Proxy Backend)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=beofold
+Group=beofold
+# UMask 0022 ensures Apache (www-data / apache) can serve /var/lib/beofold/blobs/ via static Alias
+UMask=0022
+StateDirectory=beofold
+WorkingDirectory=/var/lib/beofold
+EnvironmentFile=/etc/beofold/sync.env
+
+ExecStart=/usr/local/bin/fold-sync serve \
+    --bind ${BEOFOLD_SYNC_BIND} \
+    --data-dir /var/lib/beofold \
+    --quorum ${BEOFOLD_SYNC_QUORUM} \
+    $BEOFOLD_SYNC_EXTRA_ARGS
+
+KillSignal=SIGTERM
+TimeoutStopSec=20
+Restart=always
+RestartSec=3
+
+# Full device & filesystem isolation (web sync server requires zero GPU access)
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

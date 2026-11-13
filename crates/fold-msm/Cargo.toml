@@ -1,0 +1,19 @@
+[package]
+name = "fold-msm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pure-Rust Markov State Model (MSM) C-alpha RMSD microstate clusterer, reversible detailed-balance MLE, Jacobi eigensolver, PCCA+ coarse-grainer, and free-energy landscape exporter"
+
+[[bin]]
+name = "fold-msm"
+path = "src/main.rs"
+
+[dependencies]
+blake3.workspace = true
+clap.workspace = true
+fold-physics.workspace = true
+fold-proto.workspace = true
+fold-storage.workspace = true
+rayon.workspace = true
+thiserror.workspace = true

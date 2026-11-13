@@ -1,0 +1,777 @@
+use crate::lan_client::{
+    spawn_network_telemetry_thread, NetworkTelemetryState, PollerTargets,
+};
+use crate::live_sandbox::{
+    spawn_live_folding_worker, LiveFoldingState, SandboxCommand, TargetPreset,
+};
+use crate::msm_tab::MsmLandscapeTab;
+use crate::plots::draw_scientific_trace;
+use crate::viewport3d::{ConformationViewport, RenderRepresentation};
+use egui::{Color32, RichText};
+use fold_proto::ComputeTier;
+use fold_storage::to_hex;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::Duration;
+use tokio::sync::watch;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceTab {
+    FoldingStudio3D,
+    LanBeowulfMatrix,
+    GlobalWanFederation,
+    MsmFreeEnergyFlux,
+}
+
+pub struct GuiLaunchConfig {
+    pub lan_peer: String,
+    pub cluster_secret: String,
+    pub sync_url: String,
+    pub vault_dir: String,
+    pub use_gpu: bool,
+}
+
+pub struct BeoFoldGuiApp {
+    active_tab: WorkspaceTab,
+
+    // Connection bar editable fields
+    lan_peer_input: String,
+    cluster_secret_input: String,
+    wan_sync_url_input: String,
+    vault_dir_input: String,
+    export_pdb_path: String,
+
+    // Local studio controls
+    selected_preset: TargetPreset,
+    steps_per_slice: u64,
+    use_gpu: bool,
+
+    // Shared worker channels & telemetry snapshots
+    net_state: Arc<Mutex<NetworkTelemetryState>>,
+    net_targets_tx: watch::Sender<PollerTargets>,
+    live_state: Arc<Mutex<LiveFoldingState>>,
+    sandbox_tx: mpsc::Sender<SandboxCommand>,
+    viewport: ConformationViewport,
+    msm_tab: MsmLandscapeTab,
+    last_export_msg: Option<String>,
+}
+
+impl BeoFoldGuiApp {
+    pub fn new(cc: &eframe::CreationContext<'_>, cfg: GuiLaunchConfig) -> Self {
+        let mut visuals = egui::Visuals::dark();
+        visuals.panel_fill = Color32::from_rgb(15, 20, 28);
+        visuals.window_fill = Color32::from_rgb(18, 24, 34);
+        cc.egui_ctx.set_visuals(visuals);
+
+        let initial_targets = PollerTargets {
+            lan_peer: cfg.lan_peer.trim().parse::<SocketAddr>().ok(),
+            cluster_secret: cfg.cluster_secret.clone(),
+            wan_sync_url: if cfg.sync_url.trim().is_empty() {
+                None
+            } else {
+                Some(cfg.sync_url.trim().to_string())
+            },
+        };
+
+        let net_state = Arc::new(Mutex::new(NetworkTelemetryState {
+            lan_target: cfg.lan_peer.clone(),
+            lan_secret: cfg.cluster_secret.clone(),
+            wan_sync_url: cfg.sync_url.clone(),
+            ..Default::default()
+        }));
+        let net_targets_tx = spawn_network_telemetry_thread(initial_targets, net_state.clone());
+
+        let preset = TargetPreset::TrpCage1L2Y;
+        let live_state = Arc::new(Mutex::new(LiveFoldingState::new_preset(
+            preset,
+            cfg.use_gpu,
+        )));
+        let sandbox_tx = spawn_live_folding_worker(live_state.clone(), preset, cfg.use_gpu);
+
+        Self {
+            active_tab: WorkspaceTab::FoldingStudio3D,
+            lan_peer_input: cfg.lan_peer,
+            cluster_secret_input: cfg.cluster_secret,
+            wan_sync_url_input: cfg.sync_url,
+            vault_dir_input: cfg.vault_dir,
+            export_pdb_path: "./beofold_supervisor_best.pdb".to_string(),
+            selected_preset: preset,
+            steps_per_slice: 150,
+            use_gpu: cfg.use_gpu,
+            net_state,
+            net_targets_tx,
+            live_state,
+            sandbox_tx,
+            viewport: ConformationViewport::default(),
+            msm_tab: MsmLandscapeTab::default(),
+            last_export_msg: None,
+        }
+    }
+
+    fn apply_network_targets(&self) {
+        let parsed_peer = self.lan_peer_input.trim().parse::<SocketAddr>().ok();
+        let wan_opt = if self.wan_sync_url_input.trim().is_empty() {
+            None
+        } else {
+            Some(self.wan_sync_url_input.trim().to_string())
+        };
+        let _ = self.net_targets_tx.send(PollerTargets {
+            lan_peer: parsed_peer,
+            cluster_secret: self.cluster_secret_input.clone(),
+            wan_sync_url: wan_opt,
+        });
+    }
+
+    fn render_top_bar(&mut self, ui: &mut egui::Ui, net: &NetworkTelemetryState) {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("BEOFOLD v1.3")
+                    .strong()
+                    .size(16.0)
+                    .color(Color32::from_rgb(56, 189, 248)),
+            );
+            ui.separator();
+
+            ui.selectable_value(
+                &mut self.active_tab,
+                WorkspaceTab::FoldingStudio3D,
+                "3D Conformation & MREMD Studio",
+            );
+            ui.selectable_value(
+                &mut self.active_tab,
+                WorkspaceTab::LanBeowulfMatrix,
+                format!(
+                    "LAN Beowulf Matrix ({})",
+                    net.lan_snapshot
+                        .as_ref()
+                        .map(|s| s.peers.len())
+                        .unwrap_or(0)
+                ),
+            );
+            ui.selectable_value(
+                &mut self.active_tab,
+                WorkspaceTab::GlobalWanFederation,
+                format!(
+                    "Apache WAN Federation ({})",
+                    net.wan_snapshot
+                        .as_ref()
+                        .map(|w| w.clusters.len())
+                        .unwrap_or(0)
+                ),
+            );
+            ui.selectable_value(
+                &mut self.active_tab,
+                WorkspaceTab::MsmFreeEnergyFlux,
+                "MSM Free-Energy & Flux",
+            );
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let wan_badge = if net.wan_connected {
+                    ("WAN: SYNCED", Color32::from_rgb(52, 211, 153))
+                } else if self.wan_sync_url_input.trim().is_empty() {
+                    ("WAN: OFFLINE", Color32::from_rgb(120, 132, 150))
+                } else {
+                    ("WAN: RETRYING", Color32::from_rgb(251, 191, 36))
+                };
+                ui.label(RichText::new(wan_badge.0).monospace().color(wan_badge.1));
+                ui.separator();
+
+                let lan_badge = if net.lan_connected {
+                    ("LAN QUIC: ONLINE", Color32::from_rgb(52, 211, 153))
+                } else {
+                    ("LAN QUIC: STANDBY", Color32::from_rgb(148, 163, 184))
+                };
+                ui.label(RichText::new(lan_badge.0).monospace().color(lan_badge.1));
+            });
+        });
+
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("LAN Peer:").monospace().size(11.5));
+            ui.add(egui::TextEdit::singleline(&mut self.lan_peer_input).desired_width(135.0));
+
+            ui.label(RichText::new("Secret:").monospace().size(11.5));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.cluster_secret_input)
+                    .password(true)
+                    .desired_width(110.0),
+            );
+
+            ui.label(RichText::new("Apache Sync URL:").monospace().size(11.5));
+            ui.add(egui::TextEdit::singleline(&mut self.wan_sync_url_input).desired_width(240.0));
+
+            if ui.button("Connect / Refresh").clicked() {
+                self.apply_network_targets();
+            }
+        });
+    }
+
+    fn render_studio_tab(&mut self, ctx: &egui::Context, live: &LiveFoldingState) {
+        egui::SidePanel::left("studio_left_panel")
+            .resizable(true)
+            .default_width(335.0)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.heading("Local MREMD Folding Runner");
+                    ui.label(
+                        RichText::new(&live.active_backend_label)
+                            .monospace()
+                            .size(11.5)
+                            .color(Color32::from_rgb(56, 189, 248)),
+                    );
+                    ui.add_space(6.0);
+
+                    ui.horizontal(|ui| {
+                        let btn_label = if live.running {
+                            "Pause Folding"
+                        } else {
+                            "Start Live MREMD"
+                        };
+                        if ui.button(RichText::new(btn_label).strong()).clicked() {
+                            let _ = self
+                                .sandbox_tx
+                                .send(SandboxCommand::SetRunning(!live.running));
+                        }
+                        if ui.button("Reset Seed").clicked() {
+                            let _ = self.sandbox_tx.send(SandboxCommand::ResetTarget {
+                                preset: self.selected_preset,
+                                use_gpu: self.use_gpu,
+                                steps_per_slice: self.steps_per_slice,
+                            });
+                        }
+                    });
+
+                    ui.add_space(6.0);
+                    egui::ComboBox::from_label("Target")
+                        .selected_text(self.selected_preset.label())
+                        .show_ui(ui, |ui| {
+                            for p in [TargetPreset::TrpCage1L2Y, TargetPreset::VillinHP35] {
+                                if ui
+                                    .selectable_value(&mut self.selected_preset, p, p.label())
+                                    .changed()
+                                {
+                                    let _ = self.sandbox_tx.send(SandboxCommand::ResetTarget {
+                                        preset: self.selected_preset,
+                                        use_gpu: self.use_gpu,
+                                        steps_per_slice: self.steps_per_slice,
+                                    });
+                                }
+                            }
+                        });
+
+                    if ui
+                        .checkbox(&mut self.use_gpu, "Enable wgpu WGSL Compute Shaders")
+                        .changed()
+                    {
+                        let _ = self
+                            .sandbox_tx
+                            .send(SandboxCommand::SetUseGpu(self.use_gpu));
+                    }
+
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut self.steps_per_slice, 50..=1500)
+                                .text("Steps / Slice"),
+                        )
+                        .changed()
+                    {
+                        let _ = self
+                            .sandbox_tx
+                            .send(SandboxCommand::SetStepsPerSlice(self.steps_per_slice));
+                    }
+
+                    ui.separator();
+                    ui.heading("3D Viewport & PDB Export");
+                    egui::ComboBox::from_label("Style")
+                        .selected_text(self.viewport.representation.label())
+                        .show_ui(ui, |ui| {
+                            for rep in [
+                                RenderRepresentation::BackboneAndSidechains,
+                                RenderRepresentation::CAlphaRibbonOnly,
+                                RenderRepresentation::AllHeavyAtoms,
+                            ] {
+                                ui.selectable_value(
+                                    &mut self.viewport.representation,
+                                    rep,
+                                    rep.label(),
+                                );
+                            }
+                        });
+
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut self.viewport.auto_spin, "Auto-Spin");
+                        ui.checkbox(
+                            &mut self.viewport.show_best_conformation,
+                            "Lock Lowest-E Fold",
+                        );
+                        if ui.button("Reset Cam").clicked() {
+                            self.viewport.reset_camera();
+                        }
+                    });
+
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.export_pdb_path)
+                                .desired_width(185.0),
+                        );
+                        if ui.button("Export .pdb").clicked() {
+                            let out = PathBuf::from(self.export_pdb_path.trim());
+                            match live.export_best_pdb(&out) {
+                                Ok(()) => {
+                                    self.last_export_msg =
+                                        Some(format!("Saved PDB to {}", out.display()));
+                                }
+                                Err(e) => {
+                                    self.last_export_msg = Some(format!("Export failed: {}", e));
+                                }
+                            }
+                        }
+                    });
+                    if let Some(ref msg) = self.last_export_msg {
+                        ui.label(
+                            RichText::new(msg)
+                                .monospace()
+                                .size(11.0)
+                                .color(Color32::from_rgb(52, 211, 153)),
+                        );
+                    }
+
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.vault_dir_input)
+                                .desired_width(175.0),
+                        );
+                        if ui.button("Load redb Vault").clicked() {
+                            let _ = self.sandbox_tx.send(SandboxCommand::LoadFromVault {
+                                data_dir: PathBuf::from(self.vault_dir_input.trim()),
+                                project_id: 1,
+                            });
+                        }
+                    });
+
+                    ui.separator();
+                    ui.heading("4-Rung MREMD Replica Ladder");
+                    ui.label(
+                        RichText::new(format!(
+                            "Throughput: {:.2} ns/day | Lowest V_pot: {:.2} kcal/mol ({})",
+                            live.instantaneous_ns_per_day, live.best_potential_kcal, live.best_wu
+                        ))
+                        .monospace()
+                        .size(11.0),
+                    );
+
+                    egui::Grid::new("mremd_rung_grid")
+                        .striped(true)
+                        .num_columns(5)
+                        .show(ui, |ui| {
+                            ui.label(RichText::new("Rung").strong().monospace());
+                            ui.label(RichText::new("Bath").strong().monospace());
+                            ui.label(RichText::new("Gen").strong().monospace());
+                            ui.label(RichText::new("V_pot").strong().monospace());
+                            ui.label(RichText::new("Rg / RMSD").strong().monospace());
+                            ui.end_row();
+
+                            for r in &live.rungs {
+                                ui.label(RichText::new(format!("R{}", r.rung_idx)).monospace());
+                                ui.label(
+                                    RichText::new(format!("{:.0}K", r.temperature_kelvin))
+                                        .monospace(),
+                                );
+                                ui.label(RichText::new(format!("G{}", r.generation)).monospace());
+                                ui.label(
+                                    RichText::new(format!("{:.1}", r.potential_kcal)).monospace(),
+                                );
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{:.1} / {:.1}A",
+                                        r.rg_angstrom, r.rmsd_seed_ang
+                                    ))
+                                    .monospace(),
+                                );
+                                ui.end_row();
+                            }
+                        });
+
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("Adjacent Rung Swap Acceptance:").strong());
+                    for (idx, &(acc, trials)) in live.swap_pair_stats.iter().enumerate() {
+                        let rate = if trials > 0 {
+                            (acc as f32) / (trials as f32)
+                        } else {
+                            0.0
+                        };
+                        ui.add(
+                            egui::ProgressBar::new(rate).text(format!(
+                                "R{} <-> R{}: {}/{} ({:.1}%)",
+                                idx,
+                                idx + 1,
+                                acc,
+                                trials,
+                                rate * 100.0
+                            )),
+                        );
+                    }
+                });
+            });
+
+        egui::SidePanel::right("studio_right_plots")
+            .resizable(true)
+            .default_width(350.0)
+            .show(ctx, |ui| {
+                ui.heading("Thermodynamic & MSM Traces");
+                ui.add_space(4.0);
+                draw_scientific_trace(
+                    ui,
+                    "Potential Energy V_total (green = min)",
+                    "kcal/mol",
+                    &live.potential_history,
+                    Some(&live.min_potential_history),
+                    Color32::from_rgb(56, 189, 248),
+                    155.0,
+                );
+                ui.add_space(8.0);
+                draw_scientific_trace(
+                    ui,
+                    "Radius of Gyration R_g",
+                    "A",
+                    &live.rg_history,
+                    None,
+                    Color32::from_rgb(245, 190, 65),
+                    140.0,
+                );
+                ui.add_space(8.0);
+                draw_scientific_trace(
+                    ui,
+                    "C-Alpha RMSD from Unfolded Seed",
+                    "A",
+                    &live.rmsd_history,
+                    None,
+                    Color32::from_rgb(192, 132, 252),
+                    140.0,
+                );
+            });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let coords = if self.viewport.show_best_conformation {
+                &live.best_positions
+            } else {
+                &live.current_positions
+            };
+            let mode_str = if self.viewport.show_best_conformation {
+                format!(
+                    "Lowest-Energy Conformation {} ({:.2} kcal/mol)",
+                    live.best_wu, live.best_potential_kcal
+                )
+            } else {
+                format!(
+                    "Active Conformation {} ({:.2} kcal/mol)",
+                    live.best_wu, live.best_potential_kcal
+                )
+            };
+            self.viewport.ui(ui, &live.topology, coords, &mode_str);
+        });
+    }
+
+    fn render_lan_matrix_tab(&mut self, ctx: &egui::Context, net: &NetworkTelemetryState) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading("Home Beowulf LAN Cluster Matrix (QUIC TLS 1.3 + Raft)");
+            if let Some(ref err) = net.lan_last_error {
+                ui.label(
+                    RichText::new(format!("LAN poll status: {}", err))
+                        .monospace()
+                        .color(Color32::from_rgb(251, 191, 36)),
+                );
+            }
+
+            let Some(ref snap) = net.lan_snapshot else {
+                ui.add_space(12.0);
+                ui.label(
+                    "No active LAN Beowulf node connected yet. Launch `fold-node mesh --init-trpcage` on your machines and click 'Connect / Refresh' above.",
+                );
+                return;
+            };
+
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!("Raft Term: {}", snap.raft_term))
+                        .strong()
+                        .monospace(),
+                );
+                ui.separator();
+                let ldr_str = snap
+                    .leader
+                    .as_ref()
+                    .map(|l| format!("{} ({}..)", l.addr, &to_hex(&l.node_pubkey)[0..10]))
+                    .unwrap_or_else(|| "Election in progress".into());
+                ui.label(RichText::new(format!("Leader: {}", ldr_str)).monospace());
+                ui.separator();
+                ui.label(
+                    RichText::new(format!(
+                        "PRCG Units: {} done / {} leased / {} queued ({} total)",
+                        snap.completed_workunits,
+                        snap.leased_workunits,
+                        snap.queued_workunits,
+                        snap.total_workunits
+                    ))
+                    .monospace(),
+                );
+                ui.separator();
+                ui.label(
+                    RichText::new(format!(
+                        "MREMD Swaps: {}/{} | Quarantined: {}",
+                        snap.mremd_swaps, snap.mremd_trials, snap.quarantined_events
+                    ))
+                    .monospace(),
+                );
+            });
+
+            ui.separator();
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                egui::Grid::new("lan_peer_cards_grid")
+                    .striped(true)
+                    .num_columns(7)
+                    .spacing([16.0, 10.0])
+                    .show(ui, |ui| {
+                        ui.label(RichText::new("Hostname").strong());
+                        ui.label(RichText::new("OS / Arch").strong());
+                        ui.label(RichText::new("Compute Tier").strong());
+                        ui.label(RichText::new("Villin Rate").strong());
+                        ui.label(RichText::new("Active PRCG Chunk").strong());
+                        ui.label(RichText::new("CPU Load").strong());
+                        ui.label(RichText::new("Endpoint").strong());
+                        ui.end_row();
+
+                        for peer in &snap.peers {
+                            ui.label(RichText::new(&peer.capability.hostname).monospace());
+                            ui.label(
+                                RichText::new(format!(
+                                    "{}/{} ({}c)",
+                                    peer.capability.os,
+                                    peer.capability.arch,
+                                    peer.capability.logical_cores
+                                ))
+                                .monospace(),
+                            );
+                            let tier_col = match peer.capability.tier {
+                                ComputeTier::TierS => Color32::from_rgb(52, 211, 153),
+                                ComputeTier::TierA => Color32::from_rgb(56, 189, 248),
+                                ComputeTier::TierB => Color32::from_rgb(245, 190, 65),
+                            };
+                            ui.label(
+                                RichText::new(format!("{}", peer.capability.tier))
+                                    .monospace()
+                                    .color(tier_col),
+                            );
+                            ui.label(
+                                RichText::new(format!(
+                                    "{:.2} ns/day",
+                                    peer.capability.villin_ns_per_day
+                                ))
+                                .monospace(),
+                            );
+                            let wu_label = peer
+                                .active_wu
+                                .map(|w| format!("{}", w))
+                                .unwrap_or_else(|| "IDLE / STAGING".into());
+                            ui.label(RichText::new(wu_label).monospace());
+                            let throt_str = if peer.throttled {
+                                format!("{:.0}% [THROTTLED]", peer.cpu_usage_pct)
+                            } else {
+                                format!("{:.0}%", peer.cpu_usage_pct)
+                            };
+                            ui.label(RichText::new(throt_str).monospace());
+                            ui.label(RichText::new(&peer.addr).monospace());
+                            ui.end_row();
+                        }
+                    });
+            });
+        });
+    }
+
+    fn render_wan_federation_tab(&mut self, ctx: &egui::Context, net: &NetworkTelemetryState) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading("Global Multi-Cluster Federation (Apache HTTP Sync Server)");
+            if let Some(ref err) = net.wan_last_error {
+                ui.label(
+                    RichText::new(format!("WAN sync poll error: {}", err))
+                        .monospace()
+                        .color(Color32::from_rgb(248, 113, 113)),
+                );
+            }
+
+            let Some(ref wan) = net.wan_snapshot else {
+                ui.add_space(12.0);
+                ui.label(
+                    "Enter your Apache Web Sync URL (e.g. `https://yourdomain.com/beofold/api/v1` or `http://127.0.0.1:8780/beofold/api/v1`) in the top bar and click 'Connect / Refresh'.",
+                );
+                return;
+            };
+
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "Global Aggregate Throughput: {:.2} ns/day",
+                        wan.aggregate_ns_per_day
+                    ))
+                    .strong()
+                    .color(Color32::from_rgb(52, 211, 153)),
+                );
+                ui.separator();
+                ui.label(RichText::new(format!("Quorum Mode: {}", wan.quorum_mode)).monospace());
+                ui.separator();
+                ui.label(
+                    RichText::new(format!(
+                        "Canary Audits Passed: {} | Quarantined: {}",
+                        wan.canary_audits_passed, wan.quarantined_events
+                    ))
+                    .monospace(),
+                );
+            });
+
+            ui.add_space(4.0);
+            let done_frac = if wan.total_workunits > 0 {
+                (wan.completed_workunits as f32) / (wan.total_workunits as f32)
+            } else {
+                0.0
+            };
+            ui.add(egui::ProgressBar::new(done_frac).text(format!(
+                "Global PRCG Progress: {} completed | {} leased | {} quorum-pending | {} queued ({} total)",
+                wan.completed_workunits,
+                wan.leased_workunits,
+                wan.quorum_pending_workunits,
+                wan.queued_workunits,
+                wan.total_workunits
+            )));
+
+            if let Some((best_wu, best_e)) = wan.lowest_potential_kcal {
+                ui.label(
+                    RichText::new(format!(
+                        "Lowest Global Conformation Energy: {:.3} kcal/mol ({})",
+                        best_e, best_wu
+                    ))
+                    .monospace()
+                    .color(Color32::from_rgb(56, 189, 248)),
+                );
+            }
+
+            ui.separator();
+            ui.heading(format!(
+                "Registered Remote Beowulf Clusters ({})",
+                wan.clusters.len()
+            ));
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                egui::Grid::new("wan_clusters_grid")
+                    .striped(true)
+                    .num_columns(7)
+                    .spacing([16.0, 10.0])
+                    .show(ui, |ui| {
+                        ui.label(RichText::new("Cluster Name").strong());
+                        ui.label(RichText::new("Ed25519 Key").strong());
+                        ui.label(RichText::new("Nodes (S/A/B)").strong());
+                        ui.label(RichText::new("Aggregate Rate").strong());
+                        ui.label(RichText::new("OS Mix").strong());
+                        ui.label(RichText::new("Trust").strong());
+                        ui.label(RichText::new("Completed / Quarantined").strong());
+                        ui.end_row();
+
+                        for c in &wan.clusters {
+                            ui.label(RichText::new(&c.cluster_name).strong().monospace());
+                            ui.label(
+                                RichText::new(&to_hex(&c.cluster_pubkey)[0..12]).monospace(),
+                            );
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} ({}/{}/{})",
+                                    c.total_nodes, c.tier_s_nodes, c.tier_a_nodes, c.tier_b_nodes
+                                ))
+                                .monospace(),
+                            );
+                            ui.label(
+                                RichText::new(format!("{:.2} ns/day", c.aggregate_ns_per_day))
+                                    .monospace(),
+                            );
+                            ui.label(RichText::new(&c.os_summary).monospace());
+                            let trust_txt = if c.trusted {
+                                ("TRUSTED (q=1)", Color32::from_rgb(52, 211, 153))
+                            } else {
+                                ("EXTERNAL (q=2)", Color32::from_rgb(251, 191, 36))
+                            };
+                            ui.label(RichText::new(trust_txt.0).monospace().color(trust_txt.1));
+                            ui.label(
+                                RichText::new(format!(
+                                    "{} / {}",
+                                    c.completed_units, c.quarantined_units
+                                ))
+                                .monospace(),
+                            );
+                            ui.end_row();
+                        }
+                    });
+            });
+        });
+    }
+}
+
+impl eframe::App for BeoFoldGuiApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let net_snap = self
+            .net_state
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        let live_snap = self
+            .live_state
+            .lock()
+            .expect("live folding state mutex poisoned")
+            .clone();
+
+        egui::TopBottomPanel::top("beofold_top_bar").show(ctx, |ui| {
+            self.render_top_bar(ui, &net_snap);
+        });
+
+        egui::TopBottomPanel::bottom("beofold_status_footer").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(&live_snap.status_banner)
+                        .monospace()
+                        .size(11.5)
+                        .color(Color32::from_rgb(180, 194, 212)),
+                );
+            });
+        });
+
+        match self.active_tab {
+            WorkspaceTab::FoldingStudio3D => self.render_studio_tab(ctx, &live_snap),
+            WorkspaceTab::LanBeowulfMatrix => self.render_lan_matrix_tab(ctx, &net_snap),
+            WorkspaceTab::GlobalWanFederation => self.render_wan_federation_tab(ctx, &net_snap),
+            WorkspaceTab::MsmFreeEnergyFlux => {
+                if self.msm_tab.render(
+                    ctx,
+                    &live_snap,
+                    &mut self.vault_dir_input,
+                    &self.sandbox_tx,
+                ) {
+                    self.viewport.show_best_conformation = false;
+                    self.active_tab = WorkspaceTab::FoldingStudio3D;
+                }
+            }
+        }
+
+        if live_snap.running || self.viewport.auto_spin || self.msm_tab.is_animating() {
+            ctx.request_repaint_after(Duration::from_millis(33));
+        } else {
+            ctx.request_repaint_after(Duration::from_millis(500));
+        }
+    }
+}
+
+impl Drop for BeoFoldGuiApp {
+    fn drop(&mut self) {
+        let _ = self.sandbox_tx.send(SandboxCommand::Shutdown);
+    }
+}

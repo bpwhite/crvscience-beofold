@@ -1,0 +1,48 @@
+# /etc/systemd/system/beofold-node.service
+# BeoFold Unattended Beowulf LAN Compute & Cluster Leader Node
+# Documentation: https://www.freedesktop.org/software/systemd/man/systemd.service.html
+
+[Unit]
+Description=BeoFold Distributed Protein Folding Compute & LAN Raft Node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=beofold
+Group=beofold
+StateDirectory=beofold-node
+WorkingDirectory=/var/lib/beofold-node
+EnvironmentFile=/etc/beofold/node.env
+
+ExecStart=/usr/local/bin/fold-node mesh \
+    --data-dir /var/lib/beofold-node \
+    --bind ${BEOFOLD_BIND_ADDR} \
+    --cluster-secret ${BEOFOLD_CLUSTER_SECRET} \
+    --sync-url "${BEOFOLD_SYNC_URL}" \
+    --cluster-name "${BEOFOLD_CLUSTER_NAME}" \
+    --label "${BEOFOLD_NODE_LABEL}" \
+    $BEOFOLD_NODE_EXTRA_ARGS
+
+# Graceful SIGTERM handler flushes redb ACID checkpoints and closes QUIC streams
+KillSignal=SIGTERM
+TimeoutStopSec=25
+Restart=always
+RestartSec=5
+
+# Lower CPU scheduling priority slightly so interactive SSH/desktop tasks stay snappy
+Nice=10
+
+# Filesystem & privilege hardening while preserving headless Vulkan /dev/dri/renderD* GPU access
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=false
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

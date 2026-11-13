@@ -1,0 +1,56 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/fold-proto",
+    "crates/fold-physics",
+    "crates/fold-storage",
+    "crates/fold-node",
+    "crates/fold-sync",
+    "crates/fold-gui",
+    "crates/fold-msm",
+]
+
+[workspace.package]
+version = "1.4.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Bryan P. White"]
+description = "BeoFold: Pure-Rust distributed Beowulf & multi-cluster protein structure folding engine"
+
+[workspace.dependencies]
+axum = "0.8"
+blake3 = "1.5"
+bytemuck = { version = "1.20", features = ["derive"] }
+clap = { version = "4.5", features = ["derive"] }
+ed25519-dalek = "2.1"
+eframe = "0.31"
+egui = "0.31"
+getrandom = "0.2"
+lz4_flex = "0.11"
+mdns-sd = "0.21"
+pdbtbx = "0.12"
+pollster = "0.4"
+quinn = "0.11"
+rayon = "1.10"
+rcgen = "0.14"
+redb = "2.6"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+rkyv = { version = "0.8", features = ["bytecheck"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+sysinfo = "0.33"
+thiserror = "2.0"
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
+wgpu = "30"
+
+# Internal workspace crates
+fold-proto = { path = "crates/fold-proto" }
+fold-physics = { path = "crates/fold-physics" }
+fold-storage = { path = "crates/fold-storage" }
+fold-sync = { path = "crates/fold-sync" }
+fold-msm = { path = "crates/fold-msm" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = false

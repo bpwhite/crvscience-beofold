@@ -1,0 +1,24 @@
+[package]
+name = "fold-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "BeoFold desktop Supervisor Workstation (eframe/egui) for LAN Beowulf cluster control, Apache WAN federation telemetry, Markov State Model free-energy surfaces, and interactive 3D protein conformation viewing"
+
+[[bin]]
+name = "fold-gui"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+eframe.workspace = true
+egui.workspace = true
+fold-msm.workspace = true
+fold-physics.workspace = true
+fold-proto.workspace = true
+fold-storage.workspace = true
+quinn.workspace = true
+rcgen.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+tokio.workspace = true

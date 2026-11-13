@@ -1,0 +1,19 @@
+[package]
+name = "fold-physics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pure-Rust molecular dynamics force field, Morton Z-order neighbor lists, wgpu WGSL compute kernels, Langevin BAOAB integrator, MREMD, and biophysical sanity gate"
+
+[dependencies]
+blake3.workspace = true
+bytemuck.workspace = true
+fold-proto.workspace = true
+lz4_flex.workspace = true
+pdbtbx.workspace = true
+pollster.workspace = true
+rayon.workspace = true
+rkyv.workspace = true
+sysinfo.workspace = true
+thiserror.workspace = true
+wgpu.workspace = true

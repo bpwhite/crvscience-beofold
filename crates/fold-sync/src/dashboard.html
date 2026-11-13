@@ -1,0 +1,1018 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BeoFold Federation Observatory — Live Protein Folding Status</title>
+<style>
+  :root {
+    --bg: #0f141b;
+    --surface: #161d27;
+    --surface-alt: #1c2532;
+    --border: #2a3648;
+    --text: #e6edf5;
+    --muted: #93a3b8;
+    --accent: #4c8bf5;
+    --ok: #3ba572;
+    --warn: #d4943a;
+    --err: #d15b56;
+    --canvas-bg: #0b1017;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  [data-theme="light"] {
+    --bg: #f4f6f9;
+    --surface: #ffffff;
+    --surface-alt: #edf1f6;
+    --border: #d4dce7;
+    --text: #182230;
+    --muted: #58687c;
+    --accent: #2463eb;
+    --ok: #1f8252;
+    --warn: #b57317;
+    --err: #b83a35;
+    --canvas-bg: #eef2f7;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 14px;
+    line-height: 1.45;
+  }
+  .wrap {
+    max-width: 1400px;
+    margin: 0 auto;
+    padding: 18px 22px 32px;
+  }
+  header {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding-bottom: 14px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 18px;
+  }
+  .brand h1 {
+    margin: 0;
+    font-size: 19px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+  }
+  .brand p {
+    margin: 2px 0 0;
+    font-size: 12.5px;
+    color: var(--muted);
+  }
+  .toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+  }
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border-radius: 4px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    font-size: 12px;
+    font-family: var(--mono);
+    color: var(--muted);
+  }
+  .dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--ok);
+  }
+  .dot.stale { background: var(--warn); }
+  .dot.offline { background: var(--err); }
+  button, select, a.btn-link {
+    background: var(--surface);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 5px 10px;
+    font-size: 12.5px;
+    font-family: var(--sans);
+    cursor: pointer;
+    text-decoration: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+  }
+  button:hover, select:hover, a.btn-link:hover {
+    border-color: var(--accent);
+  }
+  a.btn-primary {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #ffffff;
+    font-weight: 500;
+  }
+  a.btn-primary:hover {
+    opacity: 0.92;
+  }
+  .kpi-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(205px, 1fr));
+    gap: 12px;
+    margin-bottom: 18px;
+  }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 13px 15px;
+  }
+  .kpi-label {
+    font-size: 11.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+    margin-bottom: 5px;
+  }
+  .kpi-val {
+    font-family: var(--mono);
+    font-size: 20px;
+    font-weight: 600;
+    margin-bottom: 4px;
+  }
+  .kpi-sub {
+    font-size: 12px;
+    color: var(--muted);
+    font-family: var(--mono);
+  }
+  .prog-track {
+    width: 100%;
+    height: 7px;
+    background: var(--surface-alt);
+    border-radius: 3px;
+    overflow: hidden;
+    display: flex;
+    margin-top: 7px;
+  }
+  .prog-seg-done { background: var(--ok); }
+  .prog-seg-leased { background: var(--accent); }
+  .prog-seg-quorum { background: var(--warn); }
+  .main-grid {
+    display: grid;
+    grid-template-columns: 7fr 5fr;
+    gap: 16px;
+  }
+  @media (max-width: 1024px) {
+    .main-grid { grid-template-columns: 1fr; }
+  }
+  .section-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 10px;
+  }
+  .section-title {
+    font-size: 14px;
+    font-weight: 600;
+    margin: 0;
+  }
+  .viewer-wrap {
+    position: relative;
+    width: 100%;
+    height: 430px;
+    background: var(--canvas-bg);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    overflow: hidden;
+  }
+  canvas#molCanvas {
+    width: 100%;
+    height: 100%;
+    display: block;
+    cursor: grab;
+    touch-action: none;
+  }
+  canvas#molCanvas:active {
+    cursor: grabbing;
+  }
+  .canvas-overlay {
+    position: absolute;
+    left: 10px;
+    bottom: 10px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 5px 9px;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--muted);
+    pointer-events: none;
+    opacity: 0.94;
+  }
+  .legend-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    margin-top: 9px;
+    font-size: 11.5px;
+    color: var(--muted);
+  }
+  .swatch {
+    display: inline-block;
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    margin-right: 4px;
+    vertical-align: middle;
+  }
+  .seq-box {
+    margin-top: 10px;
+    padding: 8px 10px;
+    background: var(--surface-alt);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    font-family: var(--mono);
+    font-size: 12px;
+    overflow-x: auto;
+    white-space: nowrap;
+  }
+  .seq-res {
+    display: inline-block;
+    padding: 2px 4px;
+    border-radius: 3px;
+    cursor: pointer;
+    user-select: none;
+  }
+  .seq-res:hover, .seq-res.selected {
+    background: var(--accent);
+    color: #ffffff;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12.5px;
+  }
+  th, td {
+    text-align: left;
+    padding: 7px 8px;
+    border-bottom: 1px solid var(--border);
+  }
+  th {
+    color: var(--muted);
+    font-weight: 500;
+    font-size: 11.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+  }
+  td.num, th.num {
+    text-align: right;
+    font-family: var(--mono);
+  }
+  .badge {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-family: var(--mono);
+    font-size: 11px;
+    border: 1px solid var(--border);
+  }
+  .badge-ok { color: var(--ok); border-color: var(--ok); }
+  .badge-warn { color: var(--warn); border-color: var(--warn); }
+  .prov-grid {
+    display: grid;
+    grid-template-columns: 135px 1fr;
+    gap: 5px 10px;
+    font-size: 12px;
+    margin-top: 8px;
+  }
+  .prov-key { color: var(--muted); }
+  .prov-val {
+    font-family: var(--mono);
+    word-break: break-all;
+  }
+  .checkbox-lbl {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 12px;
+    color: var(--muted);
+    cursor: pointer;
+    user-select: none;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="brand">
+      <h1>BeoFold Federation Observatory</h1>
+      <p>Read-Only Multi-Cluster PRCG Folding Ledger, MREMD Energetics &amp; 3D Conformation Viewer</p>
+    </div>
+    <div class="toolbar">
+      <span class="pill" id="connPill"><span class="dot" id="connDot"></span><span id="connText">Connecting...</span></span>
+      <span class="pill" id="quorumPill">Quorum: --</span>
+      <button type="button" id="btnRefresh">Refresh Now</button>
+      <button type="button" id="btnPause">Pause Poll (4s)</button>
+      <button type="button" id="btnTheme">Light Theme</button>
+    </div>
+  </header>
+
+  <section class="kpi-grid">
+    <div class="card">
+      <div class="kpi-label">Aggregate Throughput</div>
+      <div class="kpi-val" id="kpiNsDay">0.00 ns/day</div>
+      <div class="kpi-sub" id="kpiClustersSub">0 active / 0 registered clusters</div>
+    </div>
+    <div class="card">
+      <div class="kpi-label">PRCG Campaign Progress</div>
+      <div class="kpi-val" id="kpiProgress">0 / 0 WUs</div>
+      <div class="kpi-sub" id="kpiProgressSub">0 queued · 0 leased · 0 staging</div>
+      <div class="prog-track">
+        <div class="prog-seg-done" id="barDone" style="width:0%"></div>
+        <div class="prog-seg-leased" id="barLeased" style="width:0%"></div>
+        <div class="prog-seg-quorum" id="barQuorum" style="width:0%"></div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="kpi-label">Lowest Potential Energy</div>
+      <div class="kpi-val" id="kpiBestE">-- kcal/mol</div>
+      <div class="kpi-sub" id="kpiBestWu">Awaiting trajectory snapshot</div>
+    </div>
+    <div class="card">
+      <div class="kpi-label">Compactness (R_g &amp; SASA)</div>
+      <div class="kpi-val" id="kpiRg">-- Å</div>
+      <div class="kpi-sub" id="kpiSasa">SASA: -- Å^2</div>
+    </div>
+    <div class="card">
+      <div class="kpi-label">MREMD Replica Exchange</div>
+      <div class="kpi-val" id="kpiMremdRate">0.0%</div>
+      <div class="kpi-sub" id="kpiMremdCounts">0 swaps / 0 trials</div>
+    </div>
+    <div class="card">
+      <div class="kpi-label">4-Gate Biophysical Audits</div>
+      <div class="kpi-val" id="kpiCanary">0 passed</div>
+      <div class="kpi-sub" id="kpiQuarantine">0 quarantined anomalies</div>
+    </div>
+  </section>
+
+  <section class="main-grid">
+    <div class="card">
+      <div class="section-head">
+        <h2 class="section-title" id="viewerTitle">Lowest-Energy 3D Conformation</h2>
+        <div class="toolbar">
+          <select id="projectSelect" title="Active folding campaign"></select>
+          <select id="reprSelect" title="3D molecular representation">
+            <option value="beads">Backbone + Sidechain Beads</option>
+            <option value="ribbon">C-Alpha Trace (N -&gt; C)</option>
+            <option value="all">All Heavy Atoms (CPK)</option>
+          </select>
+          <label class="checkbox-lbl"><input type="checkbox" id="chkSpin" checked> Auto-Rotate</label>
+          <button type="button" id="btnResetView">Reset View</button>
+          <a class="btn-link btn-primary" id="btnDownloadPdb" href="#" download>Download .pdb</a>
+        </div>
+      </div>
+
+      <div class="viewer-wrap">
+        <canvas id="molCanvas"></canvas>
+        <div class="canvas-overlay" id="hoverInfo">Drag to orbit · Scroll to zoom · Hover atom or sequence residue</div>
+      </div>
+
+      <div class="legend-row">
+        <span><i class="swatch" style="background:#7aa2f7"></i>Backbone (N-CA-C)</span>
+        <span><i class="swatch" style="background:#d99b38"></i>Hydrophobic Core (W/Y/F/I/L/V/M)</span>
+        <span><i class="swatch" style="background:#4182e4"></i>Basic (+ K/R)</span>
+        <span><i class="swatch" style="background:#d15b56"></i>Acidic (- D/E)</span>
+        <span><i class="swatch" style="background:#56b6c2"></i>Polar / Gly</span>
+      </div>
+
+      <div class="seq-box" id="seqStrip">Sequence loading...</div>
+    </div>
+
+    <div style="display:flex; flex-direction:column; gap:16px;">
+      <div class="card">
+        <div class="section-head">
+          <h2 class="section-title">Federated Beowulf Cluster Leaderboard</h2>
+          <span class="kpi-sub" id="leaderUpdated">Updated --</span>
+        </div>
+        <div style="overflow-x:auto;">
+          <table>
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>Cluster</th>
+                <th>Nodes (S/A/B)</th>
+                <th class="num">ns/day</th>
+                <th class="num">WUs</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody id="clusterTbody">
+              <tr><td colspan="6" style="color:var(--muted); text-align:center; padding:18px;">No remote Beowulf clusters registered yet.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2 class="section-title" style="margin-bottom:6px;">Conformation Cryptographic Provenance</h2>
+        <div class="prov-grid">
+          <div class="prov-key">Campaign</div><div class="prov-val" id="provCampaign">--</div>
+          <div class="prov-key">Snapshot Stage</div><div class="prov-val" id="provStage">--</div>
+          <div class="prov-key">PRCG Coordinate</div><div class="prov-val" id="provWu">--</div>
+          <div class="prov-key">Thermostat / Time</div><div class="prov-val" id="provThermo">--</div>
+          <div class="prov-key">Energies (E_pot / E_kin)</div><div class="prov-val" id="provEnergy">--</div>
+          <div class="prov-key">BLAKE3 Digest</div><div class="prov-val" id="provBlake3">--</div>
+        </div>
+      </div>
+    </div>
+  </section>
+</div>
+
+<script>
+(function() {
+  "use strict";
+
+  function resolveApiBase() {
+    var p = window.location.pathname.replace(/\/+$/, "");
+    var apiIdx = p.indexOf("/api/v1");
+    if (apiIdx !== -1) {
+      return p.slice(0, apiIdx + 7);
+    }
+    var beoIdx = p.indexOf("/beofold");
+    if (beoIdx !== -1) {
+      return p.slice(0, beoIdx + 8) + "/api/v1";
+    }
+    return "/api/v1";
+  }
+
+  var API_BASE = resolveApiBase();
+  var pollPaused = false;
+  var selectedProjectId = null;
+  var currentConf = null;
+  var lastBestHash = "";
+  var highlightedResSeq = null;
+  var hoveredAtom = null;
+
+  var cam = {
+    yaw: 0.55,
+    pitch: 0.28,
+    zoom: 1.0,
+    dragging: false,
+    lastX: 0,
+    lastY: 0
+  };
+
+  var HYDROPHOBIC = { TRP: 1, TYR: 1, PHE: 1, ILE: 1, LEU: 1, VAL: 1, MET: 1, PRO: 1 };
+  var BASIC = { LYS: 1, ARG: 1, HIS: 1 };
+  var ACIDIC = { ASP: 1, GLU: 1 };
+
+  var elCanvas = document.getElementById("molCanvas");
+  var ctx = elCanvas.getContext("2d");
+  var projectedAtoms = [];
+
+  function updatePdbHref() {
+    var q = selectedProjectId !== null ? ("?project_id=" + encodeURIComponent(selectedProjectId)) : "";
+    document.getElementById("btnDownloadPdb").href = API_BASE + "/public/conformation/best.pdb" + q;
+  }
+
+  function escapeHtml(str) {
+    return String(str)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
+
+  async function fetchJson(url) {
+    var res = await fetch(url, {
+      headers: { "Accept": "application/json" },
+      cache: "no-store"
+    });
+    if (!res.ok) {
+      throw new Error("HTTP " + res.status);
+    }
+    return await res.json();
+  }
+
+  async function refreshAll(forceStructure) {
+    var connDot = document.getElementById("connDot");
+    var connText = document.getElementById("connText");
+    try {
+      var results = await Promise.all([
+        fetchJson(API_BASE + "/telemetry/global"),
+        fetchJson(API_BASE + "/projects/active")
+      ]);
+      var tel = results[0];
+      var projResp = results[1];
+
+      connDot.className = "dot";
+      connText.textContent = "Live · " + (pollPaused ? "Paused" : "4s sync");
+      renderProjectsDropdown(projResp.projects || []);
+      renderTelemetry(tel);
+
+      var bestKey = tel.lowest_energy_state
+        ? (tel.lowest_energy_state.workunit + ":" + tel.lowest_energy_state.potential_kcal)
+        : "gen0";
+      if (forceStructure || !currentConf || bestKey !== lastBestHash) {
+        lastBestHash = bestKey;
+        var q = selectedProjectId !== null ? ("?project_id=" + encodeURIComponent(selectedProjectId)) : "";
+        var conf = await fetchJson(API_BASE + "/public/conformation/best" + q);
+        if (conf && conf.available) {
+          currentConf = conf;
+          prepareConformationGeometry(conf);
+          renderConformationMetadata(conf);
+        }
+      }
+      updatePdbHref();
+    } catch (err) {
+      connDot.className = "dot offline";
+      connText.textContent = "Sync unreachable (" + err.message + ")";
+    }
+  }
+
+  function renderProjectsDropdown(projects) {
+    var sel = document.getElementById("projectSelect");
+    if (!projects.length) {
+      sel.innerHTML = "<option value=''>No seeded projects</option>";
+      return;
+    }
+    if (selectedProjectId === null) {
+      selectedProjectId = projects[0].project_id;
+    }
+    var currentHtml = "";
+    for (var i = 0; i < projects.length; i++) {
+      var p = projects[i];
+      var selectedAttr = (p.project_id === selectedProjectId) ? " selected" : "";
+      currentHtml += "<option value=\"" + p.project_id + "\"" + selectedAttr + ">P" +
+        p.project_id + ": " + escapeHtml(p.name) + " (" + p.residues + " aa)</option>";
+    }
+    if (sel.innerHTML !== currentHtml) {
+      sel.innerHTML = currentHtml;
+    }
+  }
+
+  function renderTelemetry(tel) {
+    document.getElementById("quorumPill").textContent = "Quorum = " + tel.quorum_mode;
+    document.getElementById("kpiNsDay").textContent = Number(tel.aggregate_ns_per_day || 0).toFixed(2) + " ns/day";
+
+    var clusters = (tel.clusters || []).slice();
+    var nowSec = Number(tel.server_unix_sec || 0);
+    var activeCount = 0;
+    for (var i = 0; i < clusters.length; i++) {
+      if (nowSec - Number(clusters[i].last_seen_unix_sec || 0) <= 300) {
+        activeCount++;
+      }
+    }
+    document.getElementById("kpiClustersSub").textContent =
+      activeCount + " online / " + clusters.length + " registered clusters";
+
+    var total = Number(tel.total_workunits || 0);
+    var done = Number(tel.completed_workunits || 0);
+    var leased = Number(tel.leased_workunits || 0);
+    var quorum = Number(tel.quorum_pending_workunits || 0);
+    var queued = Number(tel.queued_workunits || 0);
+
+    document.getElementById("kpiProgress").textContent = done + " / " + total + " WUs";
+    document.getElementById("kpiProgressSub").textContent =
+      queued + " queued · " + leased + " leased · " + quorum + " staging";
+
+    var denom = Math.max(total, 1);
+    document.getElementById("barDone").style.width = ((done * 100) / denom).toFixed(1) + "%";
+    document.getElementById("barLeased").style.width = ((leased * 100) / denom).toFixed(1) + "%";
+    document.getElementById("barQuorum").style.width = ((quorum * 100) / denom).toFixed(1) + "%";
+
+    if (tel.lowest_energy_state) {
+      document.getElementById("kpiBestE").textContent =
+        Number(tel.lowest_energy_state.potential_kcal).toFixed(2) + " kcal/mol";
+      document.getElementById("kpiBestWu").textContent = "Work Unit " + tel.lowest_energy_state.workunit;
+    }
+
+    var swaps = Number(tel.mremd_swaps || 0);
+    var trials = Number(tel.mremd_trials || 0);
+    var rate = trials > 0 ? ((swaps * 100.0) / trials) : 0.0;
+    document.getElementById("kpiMremdRate").textContent = rate.toFixed(1) + "%";
+    document.getElementById("kpiMremdCounts").textContent = swaps + " swaps / " + trials + " trials";
+
+    document.getElementById("kpiCanary").textContent = Number(tel.canary_audits_passed || 0) + " passed";
+    document.getElementById("kpiQuarantine").textContent =
+      Number(tel.quarantined_events || 0) + " quarantined anomalies";
+
+    clusters.sort(function(a, b) {
+      if (b.completed_units !== a.completed_units) {
+        return b.completed_units - a.completed_units;
+      }
+      return b.aggregate_ns_per_day - a.aggregate_ns_per_day;
+    });
+
+    var tbody = document.getElementById("clusterTbody");
+    if (!clusters.length) {
+      tbody.innerHTML = "<tr><td colspan=\"6\" style=\"color:var(--muted); text-align:center; padding:18px;\">No remote Beowulf clusters registered yet.</td></tr>";
+    } else {
+      var rows = "";
+      for (var r = 0; r < clusters.length; r++) {
+        var c = clusters[r];
+        var ageSec = Math.max(0, nowSec - Number(c.last_seen_unix_sec || 0));
+        var isOnline = ageSec <= 300;
+        var tierStr = (c.tier_s_nodes !== undefined)
+          ? (c.total_nodes + " (" + c.tier_s_nodes + "/" + c.tier_a_nodes + "/" + c.tier_b_nodes + ")")
+          : String(c.total_nodes);
+        var trustTag = c.trusted ? "Q1 Trusted" : ("Q" + tel.quorum_mode);
+        var statusCls = isOnline ? "badge-ok" : "badge-warn";
+        var statusLbl = isOnline ? ("Online · " + trustTag) : ("Idle " + ageSec + "s · " + trustTag);
+        rows += "<tr>" +
+          "<td class=\"num\">" + (r + 1) + "</td>" +
+          "<td><strong>" + escapeHtml(c.cluster_name) + "</strong><br><span class=\"kpi-sub\">" +
+            escapeHtml(c.cluster_pubkey_prefix) + " · " + escapeHtml(c.os_summary) + "</span></td>" +
+          "<td class=\"num\">" + escapeHtml(tierStr) + "</td>" +
+          "<td class=\"num\">" + Number(c.aggregate_ns_per_day).toFixed(2) + "</td>" +
+          "<td class=\"num\">" + Number(c.completed_units) + "</td>" +
+          "<td><span class=\"badge " + statusCls + "\">" + escapeHtml(statusLbl) + "</span></td>" +
+          "</tr>";
+      }
+      tbody.innerHTML = rows;
+    }
+
+    var dt = new Date();
+    document.getElementById("leaderUpdated").textContent =
+      "Synced " + dt.toLocaleTimeString([], { hour12: false });
+  }
+
+  function prepareConformationGeometry(conf) {
+    var atoms = conf.atoms || [];
+    if (!atoms.length) return;
+    var cx = 0, cy = 0, cz = 0;
+    for (var i = 0; i < atoms.length; i++) {
+      cx += atoms[i].x;
+      cy += atoms[i].y;
+      cz += atoms[i].z;
+    }
+    cx /= atoms.length;
+    cy /= atoms.length;
+    cz /= atoms.length;
+
+    var maxR = 1.0;
+    var caIndices = [];
+    for (var j = 0; j < atoms.length; j++) {
+      var dx = atoms[j].x - cx;
+      var dy = atoms[j].y - cy;
+      var dz = atoms[j].z - cz;
+      atoms[j].cx = dx;
+      atoms[j].cy = dy;
+      atoms[j].cz = dz;
+      var dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      if (dist > maxR) maxR = dist;
+      if (atoms[j].ca) caIndices.push(j);
+    }
+    conf.maxRadius = maxR;
+    conf.caIndices = caIndices;
+  }
+
+  function renderConformationMetadata(conf) {
+    var stageLabel = conf.source_stage === "completed_lowest_energy"
+      ? "Completed Lowest-Energy Conformation"
+      : "Seeded Gen-0 Starting Conformation";
+
+    document.getElementById("viewerTitle").textContent =
+      "P" + conf.project_id + " " + conf.project_name + " — " + conf.workunit;
+    document.getElementById("kpiBestE").textContent =
+      Number(conf.potential_energy_kcal).toFixed(2) + " kcal/mol";
+    document.getElementById("kpiBestWu").textContent =
+      conf.workunit + " (" + (conf.source_stage === "completed_lowest_energy" ? "verified minimum" : "seeded Gen-0") + ")";
+    document.getElementById("kpiRg").textContent = Number(conf.rg_angstrom).toFixed(2) + " Å";
+    document.getElementById("kpiSasa").textContent = "SASA: " + Number(conf.sasa_angstrom2).toFixed(1) + " Å^2";
+
+    document.getElementById("provCampaign").textContent =
+      "P" + conf.project_id + " · " + conf.project_name + " (" + conf.residue_count + " aa, " + conf.atom_count + " atoms)";
+    document.getElementById("provStage").textContent = stageLabel;
+    document.getElementById("provWu").textContent = conf.workunit + " (" + conf.cumulative_steps + " steps)";
+    document.getElementById("provThermo").textContent =
+      Number(conf.temperature_kelvin).toFixed(1) + " K · " + Number(conf.simulated_ps).toFixed(2) + " ps";
+    document.getElementById("provEnergy").textContent =
+      "E_pot = " + Number(conf.potential_energy_kcal).toFixed(3) + " kcal/mol · E_kin = " +
+      Number(conf.kinetic_energy_kcal).toFixed(3) + " kcal/mol";
+    document.getElementById("provBlake3").textContent = conf.checkpoint_blake3;
+
+    var seq = conf.sequence || "";
+    var strip = document.getElementById("seqStrip");
+    var html = "";
+    for (var k = 0; k < seq.length; k++) {
+      var resSeq = k + 1;
+      var cls = (highlightedResSeq === resSeq) ? "seq-res selected" : "seq-res";
+      html += "<span class=\"" + cls + "\" data-res=\"" + resSeq + "\" title=\"Residue " +
+        resSeq + " (" + seq[k] + ")\">" + escapeHtml(seq[k]) + "</span>";
+    }
+    strip.innerHTML = html || "Sequence unavailable";
+  }
+
+  function atomColor(atom, residueCount, repr) {
+    if (highlightedResSeq !== null && atom.seq === highlightedResSeq) {
+      return "#f6c177";
+    }
+    if (repr === "ribbon") {
+      var t = residueCount > 1 ? ((atom.seq - 1) / (residueCount - 1)) : 0.5;
+      var r = Math.round(68 + 165 * t);
+      var g = Math.round(138 + 30 * (1.0 - Math.abs(t - 0.5) * 2.0));
+      var b = Math.round(235 - 145 * t);
+      return "rgb(" + r + "," + g + "," + b + ")";
+    }
+    if (repr === "all") {
+      if (atom.elem === "N") return "#4c8bf5";
+      if (atom.elem === "O") return "#d15b56";
+      if (atom.elem === "S") return "#d9b238";
+      return "#93a3b8";
+    }
+    if (atom.bb && atom.name !== "O") return "#7aa2f7";
+    if (atom.name === "O") return "#c96560";
+    if (HYDROPHOBIC[atom.res]) return "#d99b38";
+    if (BASIC[atom.res]) return "#4182e4";
+    if (ACIDIC[atom.res]) return "#d15b56";
+    return "#56b6c2";
+  }
+
+  function rotate3D(x, y, z, yaw, pitch) {
+    var cy = Math.cos(yaw), sy = Math.sin(yaw);
+    var cp = Math.cos(pitch), sp = Math.sin(pitch);
+    var x1 = x * cy + z * sy;
+    var z1 = -x * sy + z * cy;
+    var y2 = y * cp - z1 * sp;
+    var z2 = y * sp + z1 * cp;
+    return { x: x1, y: y2, z: z2 };
+  }
+
+  function drawScene() {
+    var dpr = window.devicePixelRatio || 1;
+    var rect = elCanvas.getBoundingClientRect();
+    var w = Math.max(10, Math.floor(rect.width));
+    var h = Math.max(10, Math.floor(rect.height));
+    if (elCanvas.width !== w * dpr || elCanvas.height !== h * dpr) {
+      elCanvas.width = w * dpr;
+      elCanvas.height = h * dpr;
+    }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+
+    if (!currentConf || !currentConf.atoms || !currentConf.atoms.length) {
+      ctx.fillStyle = "#8a99ad";
+      ctx.font = "13px sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText("Waiting for seeded protein topology...", w * 0.5, h * 0.5);
+      return;
+    }
+
+    var repr = document.getElementById("reprSelect").value;
+    var atoms = currentConf.atoms;
+    var maxR = currentConf.maxRadius || 12.0;
+    var scale = (Math.min(w, h) * 0.39 * cam.zoom) / maxR;
+    var camDist = maxR * 3.8;
+
+    projectedAtoms = new Array(atoms.length);
+    for (var i = 0; i < atoms.length; i++) {
+      var a = atoms[i];
+      var rot = rotate3D(a.cx, a.cy, a.cz, cam.yaw, cam.pitch);
+      var persp = camDist / Math.max(camDist - rot.z, 2.0);
+      projectedAtoms[i] = {
+        idx: i,
+        atom: a,
+        sx: w * 0.5 + rot.x * scale * persp,
+        sy: h * 0.5 - rot.y * scale * persp,
+        z: rot.z,
+        persp: persp
+      };
+    }
+
+    // Draw covalent bonds or C-alpha trace sorted back-to-front
+    var segments = [];
+    if (repr === "ribbon") {
+      var ca = currentConf.caIndices || [];
+      for (var c = 0; c + 1 < ca.length; c++) {
+        var p0 = projectedAtoms[ca[c]];
+        var p1 = projectedAtoms[ca[c + 1]];
+        segments.push({
+          a: p0,
+          b: p1,
+          z: 0.5 * (p0.z + p1.z),
+          width: 3.4,
+          color: atomColor(p0.atom, currentConf.residue_count, repr)
+        });
+      }
+    } else {
+      var bonds = currentConf.bonds || [];
+      for (var b = 0; b < bonds.length; b++) {
+        var ia = bonds[b][0];
+        var ib = bonds[b][1];
+        if (ia >= projectedAtoms.length || ib >= projectedAtoms.length) continue;
+        var pa = projectedAtoms[ia];
+        var pb = projectedAtoms[ib];
+        if (repr === "beads" && (pa.atom.name === "O" || pb.atom.name === "O")) continue;
+        var isBb = pa.atom.bb && pb.atom.bb;
+        segments.push({
+          a: pa,
+          b: pb,
+          z: 0.5 * (pa.z + pb.z),
+          width: isBb ? 2.5 : 1.6,
+          color: isBb ? "#5b79a8" : "#6c7b91"
+        });
+      }
+    }
+
+    segments.sort(function(u, v) { return u.z - v.z; });
+    ctx.lineCap = "round";
+    for (var s = 0; s < segments.length; s++) {
+      var seg = segments[s];
+      ctx.strokeStyle = seg.color;
+      ctx.lineWidth = seg.width * 0.5 * (seg.a.persp + seg.b.persp);
+      ctx.beginPath();
+      ctx.moveTo(seg.a.sx, seg.a.sy);
+      ctx.lineTo(seg.b.sx, seg.b.sy);
+      ctx.stroke();
+    }
+
+    // Filter & depth-sort atoms
+    var drawList = [];
+    for (var k = 0; k < projectedAtoms.length; k++) {
+      var pk = projectedAtoms[k];
+      if (repr === "ribbon" && !pk.atom.ca) continue;
+      if (repr === "beads" && pk.atom.name === "O") continue;
+      drawList.push(pk);
+    }
+    drawList.sort(function(u, v) { return u.z - v.z; });
+
+    for (var d = 0; d < drawList.length; d++) {
+      var p = drawList[d];
+      var baseR = 3.2;
+      if (repr === "ribbon") {
+        baseR = 4.2;
+      } else if (repr === "beads") {
+        baseR = p.atom.bb ? (p.atom.ca ? 3.6 : 2.6) : 5.4;
+      } else {
+        baseR = p.atom.elem === "H" ? 2.1 : 3.5;
+      }
+      if (highlightedResSeq !== null && p.atom.seq === highlightedResSeq) {
+        baseR *= 1.32;
+      }
+      var rad = Math.max(1.8, baseR * p.persp * Math.sqrt(cam.zoom));
+      ctx.fillStyle = atomColor(p.atom, currentConf.residue_count, repr);
+      ctx.beginPath();
+      ctx.arc(p.sx, p.sy, rad, 0, Math.PI * 2);
+      ctx.fill();
+
+      if (hoveredAtom && hoveredAtom.idx === p.idx) {
+        ctx.strokeStyle = "#ffffff";
+        ctx.lineWidth = 1.8;
+        ctx.stroke();
+      }
+    }
+
+    // Draw 3D coordinate triad in top-right corner
+    var ox = w - 42, oy = 42, axisLen = 22;
+    var axes = [
+      { lbl: "X", v: rotate3D(1, 0, 0, cam.yaw, cam.pitch), col: "#d15b56" },
+      { lbl: "Y", v: rotate3D(0, 1, 0, cam.yaw, cam.pitch), col: "#3ba572" },
+      { lbl: "Z", v: rotate3D(0, 0, 1, cam.yaw, cam.pitch), col: "#4c8bf5" }
+    ];
+    ctx.font = "10px monospace";
+    for (var ax = 0; ax < axes.length; ax++) {
+      var item = axes[ax];
+      var ex = ox + item.v.x * axisLen;
+      var ey = oy - item.v.y * axisLen;
+      ctx.strokeStyle = item.col;
+      ctx.lineWidth = 1.6;
+      ctx.beginPath();
+      ctx.moveTo(ox, oy);
+      ctx.lineTo(ex, ey);
+      ctx.stroke();
+      ctx.fillStyle = item.col;
+      ctx.fillText(item.lbl, ex + 3, ey + 3);
+    }
+  }
+
+  function tickAnimation() {
+    if (document.getElementById("chkSpin").checked && !cam.dragging) {
+      cam.yaw += 0.0045;
+    }
+    drawScene();
+    window.requestAnimationFrame(tickAnimation);
+  }
+
+  // Pointer & hover interactions
+  elCanvas.addEventListener("pointerdown", function(ev) {
+    cam.dragging = true;
+    cam.lastX = ev.clientX;
+    cam.lastY = ev.clientY;
+    elCanvas.setPointerCapture(ev.pointerId);
+  });
+
+  elCanvas.addEventListener("pointermove", function(ev) {
+    var rect = elCanvas.getBoundingClientRect();
+    var mx = ev.clientX - rect.left;
+    var my = ev.clientY - rect.top;
+
+    if (cam.dragging) {
+      var dx = ev.clientX - cam.lastX;
+      var dy = ev.clientY - cam.lastY;
+      cam.lastX = ev.clientX;
+      cam.lastY = ev.clientY;
+      cam.yaw += dx * 0.009;
+      cam.pitch = Math.max(-1.48, Math.min(1.48, cam.pitch + dy * 0.009));
+      return;
+    }
+
+    var best = null;
+    var bestDist2 = 144.0;
+    for (var i = 0; i < projectedAtoms.length; i++) {
+      var p = projectedAtoms[i];
+      if (!p) continue;
+      var ddx = p.sx - mx;
+      var ddy = p.sy - my;
+      var d2 = ddx * ddx + ddy * ddy;
+      if (d2 < bestDist2 && (!best || p.z > best.z)) {
+        best = p;
+        bestDist2 = d2;
+      }
+    }
+    hoveredAtom = best;
+    var overlay = document.getElementById("hoverInfo");
+    if (best) {
+      var a = best.atom;
+      overlay.textContent = a.res + " " + a.seq + " · " + a.name + " (" + a.elem + ") | (" +
+        a.x.toFixed(2) + ", " + a.y.toFixed(2) + ", " + a.z.toFixed(2) + ") Å | q = " +
+        (a.q >= 0 ? "+" : "") + a.q.toFixed(3) + " e";
+    } else {
+      overlay.textContent = "Drag to orbit · Scroll to zoom · Hover atom or sequence residue";
+    }
+  });
+
+  function stopDrag() { cam.dragging = false; }
+  elCanvas.addEventListener("pointerup", stopDrag);
+  elCanvas.addEventListener("pointercancel", stopDrag);
+
+  elCanvas.addEventListener("wheel", function(ev) {
+    ev.preventDefault();
+    var factor = ev.deltaY < 0 ? 1.10 : 0.91;
+    cam.zoom = Math.max(0.40, Math.min(3.60, cam.zoom * factor));
+  }, { passive: false });
+
+  document.getElementById("seqStrip").addEventListener("mouseover", function(ev) {
+    var t = ev.target;
+    if (t && t.dataset && t.dataset.res) {
+      highlightedResSeq = Number(t.dataset.res);
+    }
+  });
+  document.getElementById("seqStrip").addEventListener("mouseout", function() {
+    highlightedResSeq = null;
+  });
+
+  document.getElementById("projectSelect").addEventListener("change", function(ev) {
+    var val = ev.target.value;
+    selectedProjectId = val ? Number(val) : null;
+    lastBestHash = "";
+    refreshAll(true);
+  });
+
+  document.getElementById("btnResetView").addEventListener("click", function() {
+    cam.yaw = 0.55;
+    cam.pitch = 0.28;
+    cam.zoom = 1.0;
+  });
+
+  document.getElementById("btnRefresh").addEventListener("click", function() {
+    refreshAll(true);
+  });
+
+  document.getElementById("btnPause").addEventListener("click", function(ev) {
+    pollPaused = !pollPaused;
+    ev.target.textContent = pollPaused ? "Resume Poll (4s)" : "Pause Poll (4s)";
+    document.getElementById("connText").textContent = "Live · " + (pollPaused ? "Paused" : "4s sync");
+  });
+
+  document.getElementById("btnTheme").addEventListener("click", function(ev) {
+    var root = document.documentElement;
+    var isLight = root.getAttribute("data-theme") === "light";
+    if (isLight) {
+      root.removeAttribute("data-theme");
+      ev.target.textContent = "Light Theme";
+    } else {
+      root.setAttribute("data-theme", "light");
+      ev.target.textContent = "Dark Theme";
+    }
+  });
+
+  refreshAll(true);
+  window.setInterval(function() {
+    if (!pollPaused) {
+      refreshAll(false);
+    }
+  }, 4000);
+  window.requestAnimationFrame(tickAnimation);
+})();
+</script>
+</body>
+</html>

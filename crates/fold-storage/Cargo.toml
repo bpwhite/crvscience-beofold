@@ -1,0 +1,15 @@
+[package]
+name = "fold-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pure-Rust redb ACID ledger and content-addressed BLAKE3 + LZ4 trajectory vault for BeoFold"
+
+[dependencies]
+blake3.workspace = true
+fold-physics.workspace = true
+fold-proto.workspace = true
+getrandom.workspace = true
+lz4_flex.workspace = true
+redb.workspace = true
+thiserror.workspace = true

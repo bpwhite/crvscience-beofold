@@ -1,0 +1,28 @@
+[package]
+name = "fold-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Headless Beowulf compute node, LAN Raft/QUIC auto-clustering mesh, and outbound Apache WAN gateway for BeoFold"
+
+[[bin]]
+name = "fold-node"
+path = "src/main.rs"
+
+[dependencies]
+blake3.workspace = true
+clap.workspace = true
+fold-physics.workspace = true
+fold-proto.workspace = true
+fold-storage.workspace = true
+fold-sync.workspace = true
+getrandom.workspace = true
+mdns-sd.workspace = true
+quinn.workspace = true
+rayon.workspace = true
+rcgen.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+sysinfo.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
