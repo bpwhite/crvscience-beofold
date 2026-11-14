@@ -1,0 +1,61 @@
+{
+  "concept_doi": "10.5281/zenodo.24222370",
+  "preprint_id": "APP-PREPRINT-02",
+  "preprint_url": "https://crvscience.com/apps/preprints/beofold-distributed-protein-msm",
+  "repo": "crvscience-beofold",
+  "schema_version": "1.0",
+  "tests": {
+    "t1_trp_cage_baoab_stability": {
+      "atom_count": 97,
+      "chunks_completed": 12,
+      "dt_fs": 2.0,
+      "final_potential_kcal": 192.9096,
+      "final_rg_angstrom": 18.4928,
+      "friction_per_ps": 1.5,
+      "mean_kinetic_temp_k": 307.8488,
+      "min_potential_kcal": 157.1580,
+      "min_rg_angstrom": 18.3048,
+      "minimized_potential_kcal": 157.1580,
+      "residue_count": 20,
+      "rg_extended_initial_angstrom": 18.8132,
+      "rg_post_minimization_angstrom": 18.9143,
+      "sequence": "NLYIQWLKDGGPSSGRPPPS",
+      "target_temp_k": 300.0,
+      "temp_std_k": 38.6050,
+      "total_steps": 1800
+    },
+    "t2_mremd_swap_and_funnel": {
+      "csv_artifact": "validation/mremd_msm_landscape.csv",
+      "direct_pair_swap_accepts": 26,
+      "direct_pair_swap_trials": 54,
+      "folded_ref_rg_angstrom": 18.9171,
+      "lowest_potential_kcal": 156.6002,
+      "max_potential_kcal": 258.9971,
+      "max_rmsd_to_best_ang": 3.0444,
+      "mean_pair_acceptance_prob": 0.5035,
+      "native_contact_pairs": 5,
+      "q_max": 1.0000,
+      "q_min": 0.6000,
+      "store_mremd_swaps": 16,
+      "store_mremd_trials": 32,
+      "temp_ladder_k": [285.0, 320.0, 360.0, 405.0],
+      "total_completed_workunits": 64,
+      "total_frames": 72
+    },
+    "t3_fold_msm_reversible_kinetics": {
+      "detailed_balance_max_error": 5.421011e-20,
+      "eigenvalue_top": 1.000000,
+      "lag_time_ps": 0.4000,
+      "macrostate_count": 3,
+      "macrostate_population_sum": 1.000000,
+      "macrostates": [{"macro_id": 0, "label": "folded_basin", "population": 0.984519, "free_energy_kcal": -0.0000, "mean_rg_angstrom": 18.5974, "mean_rmsd_best_ang": 2.2047, "mean_committor": 0.9372}, {"macro_id": 1, "label": "folded_basin", "population": 0.010464, "free_energy_kcal": 2.7091, "mean_rg_angstrom": 18.4945, "mean_rmsd_best_ang": 2.0347, "mean_committor": 0.8703}, {"macro_id": 2, "label": "folded_basin", "population": 0.005017, "free_energy_kcal": 3.1473, "mean_rg_angstrom": 18.5536, "mean_rmsd_best_ang": 2.2130, "mean_committor": 0.8917}],
+      "max_row_stochastic_error": 6.661338e-16,
+      "num_microstates": 10,
+      "pmf_grid_dims": [16, 16],
+      "stationary_pi_sum": 1.000000,
+      "top_implied_timescales_ps": [24694.262066, 4050.897914, 4050.897914, 4050.897914],
+      "total_transitions": 64
+    }
+  },
+  "version": "1.4.0"
+}

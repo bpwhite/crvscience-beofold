@@ -1,0 +1,35 @@
+cff-version: 1.2.0
+message: "If you use this software or its validation datasets, please cite both the software repository and the accompanying CRV Science Apps monograph."
+type: software
+title: "BeoFold: Distributed Langevin Molecular Dynamics, Replica-Exchange Sampling, and Markov State Kinetic Modeling"
+version: "1.4.0"
+date-released: "2026-11-14"
+doi: "10.5281/zenodo.24222370"
+url: "https://crvscience.com/apps"
+repository-code: "https://github.com/bpwhite/crvscience-beofold"
+license:
+  - "MIT"
+  - "Apache-2.0"
+authors:
+  - family-names: "White"
+    given-names: "Bryan P."
+    affiliation: "CRV Science Labs"
+keywords:
+  - "molecular dynamics"
+  - "Langevin integrator"
+  - "replica exchange"
+  - "Markov state model"
+  - "PCCA+"
+  - "Rust"
+preferred-citation:
+  type: article
+  title: "BeoFold: Distributed Langevin Molecular Dynamics, Replica-Exchange Sampling, and Markov State Kinetic Modeling"
+  authors:
+    - family-names: "White"
+      given-names: "Bryan P."
+      affiliation: "CRV Science Labs"
+  year: 2026
+  journal: "CRV Science Apps Preprints"
+  doi: "10.5281/zenodo.24222370"
+  url: "https://crvscience.com/apps/preprints/beofold-distributed-protein-msm"
+  notes: "Preprint ID: APP-PREPRINT-02"

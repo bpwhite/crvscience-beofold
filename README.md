@@ -48,3 +48,23 @@ sudo ./deploy/systemd/install-linux-systemd.sh --role node --cluster-secret "my-
 ```powershell
 .\deploy\windows\Install-BeoFoldNode.ps1 -ClusterSecret "my-home-beowulf-key" -AutoThrottle
 ```
+
+## Citation & CRV Science Apps Hub
+
+- **CRV Science Apps Hub**: <https://crvscience.com/apps>
+- **Companion Preprint (`APP-PREPRINT-02`)**: [BeoFold: Distributed Langevin Molecular Dynamics, Replica-Exchange Sampling, and Markov State Kinetic Modeling](https://crvscience.com/apps/preprints/beofold-distributed-protein-msm)
+- **Zenodo Concept DOI**: [10.5281/zenodo.24222370](https://doi.org/10.5281/zenodo.24222370)
+- **Validation Suite & Telemetry**: [`validation/README.md`](validation/README.md) (`cargo test --workspace`)
+- **Machine-Readable Metadata**: [`CITATION.cff`](CITATION.cff)
+
+```bibtex
+@article{White2026BeoFold,
+  author  = {White, Bryan P.},
+  title   = {BeoFold: Distributed Langevin Molecular Dynamics, Replica-Exchange Sampling, and Markov State Kinetic Modeling},
+  journal = {CRV Science Apps Preprints},
+  year    = {2026},
+  doi     = {10.5281/zenodo.24222370},
+  url     = {https://crvscience.com/apps/preprints/beofold-distributed-protein-msm},
+  note    = {Software v1.4.0; Preprint ID: APP-PREPRINT-02}
+}
+```
