@@ -23,7 +23,7 @@ keywords:
   - "Rust"
 preferred-citation:
   type: article
-  title: "BeoFold: Distributed Langevin Molecular Dynamics, Replica-Exchange Sampling, and Markov State Kinetic Modeling"
+  title: "BeoFold: Simulating How Proteins Fold Using Distributed Computing and State Networks"
   authors:
     - family-names: "White"
       given-names: "Bryan P."

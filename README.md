@@ -60,7 +60,7 @@ sudo ./deploy/systemd/install-linux-systemd.sh --role node --cluster-secret "my-
 ```bibtex
 @article{White2026BeoFold,
   author  = {White, Bryan P.},
-  title   = {BeoFold: Distributed Langevin Molecular Dynamics, Replica-Exchange Sampling, and Markov State Kinetic Modeling},
+  title   = {BeoFold: Simulating How Proteins Fold Using Distributed Computing and State Networks},
   journal = {CRV Science Apps Preprints},
   year    = {2026},
   doi     = {10.5281/zenodo.24222370},
