@@ -613,7 +613,7 @@ fn draw_interactive_pmf_and_flux_canvas(
     painter.rect_stroke(
         rect,
         CornerRadius::same(8),
-        Stroke::new(1.0, Color32::from_rgb(40, 52, 70)),
+        Stroke::new(1.0_f32, Color32::from_rgb(40, 52, 70)),
         StrokeKind::Inside,
     );
 
@@ -652,7 +652,7 @@ fn draw_interactive_pmf_and_flux_canvas(
     painter.rect_stroke(
         plot_rect,
         CornerRadius::same(0),
-        Stroke::new(1.2, Color32::from_rgb(90, 108, 135)),
+        Stroke::new(1.2_f32, Color32::from_rgb(90, 108, 135)),
         StrokeKind::Inside,
     );
 
@@ -736,8 +736,8 @@ fn draw_interactive_pmf_and_flux_canvas(
                     let mid = src + dir * 0.55;
                     let wing1 = mid - u * 6.5 + perp * 4.0;
                     let wing2 = mid - u * 6.5 - perp * 4.0;
-                    painter.line_segment([wing1, mid], Stroke::new(1.5, edge_col));
-                    painter.line_segment([wing2, mid], Stroke::new(1.5, edge_col));
+                    painter.line_segment([wing1, mid], Stroke::new(1.5_f32, edge_col));
+                    painter.line_segment([wing2, mid], Stroke::new(1.5_f32, edge_col));
                 }
             }
         }
@@ -767,18 +767,18 @@ fn draw_interactive_pmf_and_flux_canvas(
             painter.circle_stroke(
                 center,
                 radius + 3.2,
-                Stroke::new(1.8, Color32::from_rgb(56, 189, 248)),
+                Stroke::new(1.8_f32, Color32::from_rgb(56, 189, 248)),
             );
         }
         if is_exact_micro {
-            painter.circle_stroke(center, radius + 6.0, Stroke::new(2.2, Color32::WHITE));
+            painter.circle_stroke(center, radius + 6.0, Stroke::new(2.2_f32, Color32::WHITE));
         }
 
         painter.circle_filled(center, radius, fill);
         painter.circle_stroke(
             center,
             radius,
-            Stroke::new(1.3, Color32::from_rgb(10, 15, 24)),
+            Stroke::new(1.3_f32, Color32::from_rgb(10, 15, 24)),
         );
         painter.text(
             center,

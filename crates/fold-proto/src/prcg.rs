@@ -136,3 +136,52 @@ pub struct NodeCapabilityProfile {
     pub villin_ns_per_day: f64,
     pub tier: ComputeTier,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workunit_id_generation_order_and_parsing() {
+        let wu = WorkUnitId::new(12, 3, 4, 5);
+        assert_eq!(wu.next_generation(), WorkUnitId::new(12, 3, 4, 6));
+        assert_eq!(WorkUnitId::new(1, 0, 0, u32::MAX).next_generation().generation, u32::MAX);
+
+        let wire_bytes = wu.to_key_bytes();
+        let next_bytes = wu.next_generation().to_key_bytes();
+        assert!(wire_bytes < next_bytes);
+        assert_eq!(WorkUnitId::from_key_bytes(wire_bytes), wu);
+
+        let text = wu.to_string();
+        assert_eq!(text, "P12-R3-C4-G5");
+        assert_eq!(text.parse::<WorkUnitId>().unwrap(), wu);
+
+        assert!("P1-R2-C3".parse::<WorkUnitId>().is_err());
+        assert!("X1-R2-C3-G4".parse::<WorkUnitId>().is_err());
+        assert!("P1-R2-C3-Gabc".parse::<WorkUnitId>().is_err());
+    }
+
+    #[test]
+    fn compute_tier_and_node_capability_wire_roundtrip() {
+        assert_eq!(ComputeTier::TierS.recommended_steps(), 1_000_000);
+        assert_eq!(ComputeTier::TierA.recommended_steps(), 250_000);
+        assert_eq!(ComputeTier::TierB.recommended_steps(), 50_000);
+        assert!(ComputeTier::TierS.to_string().contains("Tier S"));
+        assert!(ComputeTier::TierA.to_string().contains("Tier A"));
+        assert!(ComputeTier::TierB.to_string().contains("Tier B"));
+
+        let profile = NodeCapabilityProfile {
+            node_pubkey: [0xAB; 32],
+            hostname: "beofold-worker-01".into(),
+            os: "windows".into(),
+            arch: "x86_64".into(),
+            logical_cores: 16,
+            total_ram_mb: 65_536,
+            villin_ns_per_day: 42.5,
+            tier: ComputeTier::TierA,
+        };
+        let frame = profile.to_compressed_frame().expect("encode profile");
+        let decoded = NodeCapabilityProfile::from_compressed_frame(&frame).expect("decode profile");
+        assert_eq!(profile, decoded);
+    }
+}

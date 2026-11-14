@@ -1,7 +1,5 @@
 use fold_proto::WIRE_MAGIC;
-use pdbtbx::{
-    ContainsAtomConformer, ContainsAtomConformerResidue, ContainsAtomConformerResidueChain, Element,
-};
+use pdbtbx::Element;
 use rkyv::rancor::Error as RkyvError;
 use rkyv::util::AlignedVec;
 use rkyv::{Archive, Deserialize, Serialize};
@@ -592,7 +590,7 @@ impl ProteinTopology {
             });
         }
         let mut out = String::with_capacity(self.atoms.len() * 84 + 256);
-        let _ = writeln!(out, "HEADER    BEOFOLD PROTEIN STRUCTURE");
+        let _ = writeln!(out, "HEADER    BEOFOLD PROTEIN STRUCTURE               01-JAN-26   BFLD");
         let _ = writeln!(out, "TITLE     {} ({})", self.name, remark_title);
         let _ = writeln!(
             out,
@@ -781,5 +779,56 @@ fn sidechain_bead_params(aa: char) -> (f32, f32, f32, f32) {
         'S' | 'T' => (38.05, 0.0, 3.55, 0.20),
         'N' | 'Q' | 'H' => (65.07, 0.0, 3.80, 0.22),
         _ => (29.06, 0.0, 3.60, 0.22),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::forcefield::{compute_sasa_angstrom2, evaluate_forces_and_energy};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TempDirGuard(std::path::PathBuf);
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn trp_cage_compressed_bytes_and_pdb_roundtrip() {
+        let (topo, coords) = ProteinTopology::build_trp_cage_seed();
+        assert_eq!(topo.residue_count, 20);
+        assert_eq!(topo.sequence_one_letter, "NLYIQWLKDGGPSSGRPPPS");
+        assert_eq!(coords.len(), topo.atoms.len());
+
+        let bytes = topo.to_compressed_bytes().expect("compress topology");
+        let decoded = ProteinTopology::from_compressed_bytes(&bytes).expect("decompress topology");
+        assert_eq!(topo, decoded);
+        assert!(ProteinTopology::from_compressed_bytes(b"BAD").is_err());
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("beofold_topo_test_{}_{}", std::process::id(), nanos));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let _guard = TempDirGuard(dir.clone());
+        let pdb_path = dir.join("trp_cage.pdb");
+
+        let sasa = compute_sasa_angstrom2(&topo, &coords);
+        assert!(sasa > 0.0 && sasa.is_finite());
+
+        let mut forces = vec![[0.0f32; 3]; topo.atoms.len()];
+        let breakdown = evaluate_forces_and_energy(&topo, &coords, &mut forces);
+        assert!(breakdown.total_kcal.is_finite());
+
+        topo.write_pdb_snapshot(&coords, &pdb_path, "test snapshot", breakdown.total_kcal)
+            .expect("write pdb");
+        let (reloaded, reloaded_coords) =
+            ProteinTopology::from_pdb_file(&pdb_path).expect("reload pdb");
+        assert_eq!(reloaded.residue_count, 20);
+        assert_eq!(reloaded.sequence_one_letter, "NLYIQWLKDGGPSSGRPPPS");
+        assert_eq!(reloaded_coords.len(), topo.atoms.len());
     }
 }

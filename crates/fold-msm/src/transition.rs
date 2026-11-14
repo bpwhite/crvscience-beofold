@@ -632,4 +632,86 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn end_to_end_rmsd_clustering_reversible_msm_and_pmf() {
+        use crate::clustering::{
+            cluster_conformations_kmedoids, compute_pairwise_rmsd_matrix, ConformationalFrame,
+        };
+        use crate::landscape::compute_2d_pmf_grid;
+        use fold_physics::ProteinTopology;
+        use fold_proto::WorkUnitId;
+
+        let (topo, base_pos) = ProteinTopology::build_trp_cage_seed();
+        let wu = WorkUnitId::new(1, 0, 0, 0);
+
+        let mut frames = Vec::with_capacity(6);
+        for step in 0..6u32 {
+            let mut pos = base_pos.clone();
+            if step == 1 {
+                // Pure rigid translation to test Kabsch/Horn RMSD translation invariance
+                for p in &mut pos {
+                    p[0] += 15.0;
+                    p[1] -= 9.5;
+                    p[2] += 4.25;
+                }
+            } else if step >= 2 {
+                let amp = 0.35 * ((step - 1) as f32);
+                for (atom_i, p) in pos.iter_mut().enumerate() {
+                    let phase = (atom_i as f32) * 0.23 + (step as f32) * 0.7;
+                    p[0] += amp * phase.sin();
+                    p[1] += amp * phase.cos();
+                }
+            }
+            let rmsd_seed = fold_physics::compute_ca_rmsd(&topo, &base_pos, &pos);
+            frames.push(ConformationalFrame {
+                frame_idx: step as usize,
+                wu_id: wu,
+                chain_step: step,
+                checkpoint_blake3: [step as u8; 32],
+                temperature_kelvin: 300.0,
+                potential_energy_kcal: -120.0 + (step as f64) * 3.5,
+                rg_angstrom: fold_physics::compute_radius_of_gyration(&topo, &pos),
+                sasa_angstrom2: 1400.0 - (step as f64) * 15.0,
+                rmsd_to_seed_ang: rmsd_seed,
+                rmsd_to_lowest_energy_ang: rmsd_seed,
+                positions_angstrom: pos,
+            });
+        }
+
+        let rmsd_mat = compute_pairwise_rmsd_matrix(&topo, &frames);
+        for i in 0..frames.len() {
+            assert!(rmsd_mat[i][i].abs() < 1e-6);
+            for j in 0..frames.len() {
+                assert!((rmsd_mat[i][j] - rmsd_mat[j][i]).abs() < 1e-9);
+            }
+        }
+        assert!(rmsd_mat[0][1] < 1e-4, "rigid translation must yield ~0 RMSD");
+
+        let clustering = cluster_conformations_kmedoids(&frames, &rmsd_mat, 3, None);
+        assert!(clustering.num_microstates >= 2 && clustering.num_microstates <= 3);
+
+        let msm = estimate_reversible_msm(&frames, &clustering, 1, 1.0, 300.0, 2)
+            .expect("estimate reversible MSM");
+        for row in &msm.transition_matrix {
+            let s: f64 = row.iter().sum();
+            assert!((s - 1.0).abs() < 1e-9);
+        }
+        let pi_sum: f64 = msm.stationary_pi.iter().sum();
+        assert!((pi_sum - 1.0).abs() < 1e-9);
+        assert!(msm.detailed_balance_max_error < 1e-8);
+
+        let grid = compute_2d_pmf_grid(&frames, &clustering, &msm, 12, 12);
+        let mut min_fe = f64::INFINITY;
+        for col in &grid.free_energy_kcal {
+            for &val in col {
+                assert!(val.is_finite());
+                assert!(val >= 0.0 && val <= grid.max_capped_kcal);
+                if val < min_fe {
+                    min_fe = val;
+                }
+            }
+        }
+        assert!(min_fe.abs() < 1e-9);
+    }
 }

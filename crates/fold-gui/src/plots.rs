@@ -22,7 +22,7 @@ pub fn draw_scientific_trace(
     painter.rect_stroke(
         rect,
         CornerRadius::same(6),
-        Stroke::new(1.0, Color32::from_rgb(38, 50, 68)),
+        Stroke::new(1.0_f32, Color32::from_rgb(38, 50, 68)),
         StrokeKind::Inside,
     );
 
@@ -76,7 +76,7 @@ pub fn draw_scientific_trace(
         let y = plot_rect.top() + frac * plot_rect.height();
         painter.line_segment(
             [Pos2::new(plot_rect.left(), y), Pos2::new(plot_rect.right(), y)],
-            Stroke::new(1.0, Color32::from_rgb(26, 35, 48)),
+            Stroke::new(1.0_f32, Color32::from_rgb(26, 35, 48)),
         );
     }
 
@@ -101,7 +101,7 @@ pub fn draw_scientific_trace(
                 let p1 = map_pt(i + 1, n, ov[i + 1]);
                 painter.line_segment(
                     [p0, p1],
-                    Stroke::new(1.4, Color32::from_rgba_unmultiplied(52, 211, 153, 185)),
+                    Stroke::new(1.4_f32, Color32::from_rgba_unmultiplied(52, 211, 153, 185)),
                 );
             }
         }
@@ -112,7 +112,7 @@ pub fn draw_scientific_trace(
         for i in 0..(n - 1) {
             let p0 = map_pt(i, n, series[i]);
             let p1 = map_pt(i + 1, n, series[i + 1]);
-            painter.line_segment([p0, p1], Stroke::new(1.9, line_color));
+            painter.line_segment([p0, p1], Stroke::new(1.9_f32, line_color));
         }
     } else if n == 1 {
         let p0 = map_pt(0, 1, series[0]);
@@ -146,7 +146,7 @@ pub fn draw_scientific_trace(
                     Pos2::new(pt.x, plot_rect.top()),
                     Pos2::new(pt.x, plot_rect.bottom()),
                 ],
-                Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 90)),
+                Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 90)),
             );
             painter.circle_filled(pt, 3.6, Color32::WHITE);
             painter.text(

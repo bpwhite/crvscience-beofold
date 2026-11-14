@@ -9,7 +9,7 @@ use fold_proto::{
     SignedWorkUnitResult, TrajectoryCheckpoint, WanWorkUnitSubmission, WorkUnitId, WorkUnitLease,
     WorkUnitRecord, WorkUnitStatus,
 };
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Database, ReadableTable, TableDefinition};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -471,8 +471,11 @@ impl FoldStore {
                 let write_txn = self.db.begin_write()?;
                 {
                     let mut wu_tbl = write_txn.open_table(WORKUNITS_TABLE)?;
-                    let target_steps = if let Some(g) = wu_tbl.get(&key[..])? {
-                        let mut rec = WorkUnitRecord::from_rkyv_bytes(g.value())?;
+                    let existing = wu_tbl
+                        .get(&key[..])?
+                        .map(|g| WorkUnitRecord::from_rkyv_bytes(g.value()))
+                        .transpose()?;
+                    let target_steps = if let Some(mut rec) = existing {
                         rec.status = WorkUnitStatus::Completed {
                             output_checkpoint_blake3: out_hash,
                         };
@@ -1028,7 +1031,8 @@ impl FoldStore {
                         next_temp = new_this_t;
                         swapped_partner = Some((candidate, new_cand_t));
                     } else {
-                        swapped_partner = Some((candidate, candidate.temperature_kelvin));
+                        let cand_temp = candidate.temperature_kelvin;
+                        swapped_partner = Some((candidate, cand_temp));
                     }
                     break;
                 }

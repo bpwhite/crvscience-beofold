@@ -45,7 +45,7 @@ pub struct MeshNodeConfig {
 }
 
 #[derive(Default, Clone)]
-struct WorkerLiveTelemetry {
+pub(crate) struct WorkerLiveTelemetry {
     active_wu: Option<WorkUnitId>,
     step_progress: u64,
     target_steps: u64,

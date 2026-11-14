@@ -1,5 +1,5 @@
 use egui::{
-    Align2, Color32, CornerRadius, FontId, PointerButton, Pos2, Rect, Sense, Stroke, StrokeKind,
+    Align2, Color32, CornerRadius, FontId, PointerButton, Pos2, Sense, Stroke, StrokeKind,
     Ui, Vec2,
 };
 use fold_physics::ProteinTopology;
@@ -87,7 +87,7 @@ impl ConformationViewport {
         painter.rect_stroke(
             rect,
             CornerRadius::same(8),
-            Stroke::new(1.0, Color32::from_rgb(42, 54, 72)),
+            Stroke::new(1.0_f32, Color32::from_rgb(42, 54, 72)),
             StrokeKind::Inside,
         );
 
@@ -332,7 +332,7 @@ impl ConformationViewport {
                     painter.circle_stroke(
                         screen,
                         radius,
-                        Stroke::new(0.8, Color32::from_rgba_unmultiplied(10, 14, 20, 180)),
+                        Stroke::new(0.8_f32, Color32::from_rgba_unmultiplied(10, 14, 20, 180)),
                     );
                     // Subtle top-left specular highlight bead
                     let spec_pos = Pos2::new(screen.x - radius * 0.28, screen.y - radius * 0.28);
@@ -378,7 +378,7 @@ impl ConformationViewport {
         if let Some((idx, scr)) = hovered_atom {
             let a = &topology.atoms[idx];
             let p = positions[idx];
-            painter.circle_stroke(scr, 10.0, Stroke::new(1.8, Color32::WHITE));
+            painter.circle_stroke(scr, 10.0, Stroke::new(1.8_f32, Color32::WHITE));
             let tip = format!(
                 "{}{} {} (#{}) | ({:.2}, {:.2}, {:.2}) A | q={:+.2}e | sigma={:.2}A",
                 a.res_name, a.res_seq, a.name, a.serial, p[0], p[1], p[2], a.charge_e, a.lj_sigma_ang

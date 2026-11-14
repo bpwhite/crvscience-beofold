@@ -22,6 +22,7 @@ const MAX_GUI_RPC_BYTES: usize = 32 * 1024 * 1024;
 const ALPN_BEOFOLD_LAN: &[u8] = b"beofold-lan-v2";
 
 /// Live network snapshot shared lock-free / low-contention with the 60 FPS `egui` render thread.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct NetworkTelemetryState {
     pub lan_target: String,

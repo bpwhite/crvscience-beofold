@@ -140,3 +140,39 @@ impl ChaCha8Rng {
         [r1 * theta1.cos(), r1 * theta1.sin(), r2 * theta2.cos()]
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prcg_seeding_is_deterministic_and_distinct_across_clones() {
+        let mut a1 = ChaCha8Rng::from_prcg_seed(WorkUnitId::new(1, 0, 0, 0), b"campaign-alpha");
+        let mut a2 = ChaCha8Rng::from_prcg_seed(WorkUnitId::new(1, 0, 0, 0), b"campaign-alpha");
+        let mut b1 = ChaCha8Rng::from_prcg_seed(WorkUnitId::new(1, 0, 1, 0), b"campaign-alpha");
+
+        for _ in 0..32 {
+            assert_eq!(a1.next_u32(), a2.next_u32());
+        }
+        let seq_a: Vec<u32> = (0..8).map(|_| a1.next_u32()).collect();
+        let seq_b: Vec<u32> = (0..8).map(|_| b1.next_u32()).collect();
+        assert_ne!(seq_a, seq_b);
+    }
+
+    #[test]
+    fn raw_parts_checkpoint_restores_bit_exact_stream_across_block_boundary() {
+        let mut rng_full = ChaCha8Rng::from_prcg_seed(WorkUnitId::new(2, 1, 0, 0), b"salt");
+        for _ in 0..25 {
+            let u = rng_full.next_f64_open01();
+            assert!(u > 0.0 && u < 1.0);
+        }
+        let (state, counter) = rng_full.to_raw_parts();
+        let mut rng_resumed = ChaCha8Rng::from_raw_parts(state, counter);
+
+        for _ in 0..40 {
+            assert_eq!(rng_full.next_u32(), rng_resumed.next_u32());
+        }
+        let g = rng_resumed.next_gaussian_vec3();
+        assert!(g.iter().all(|v| v.is_finite()));
+    }
+}

@@ -100,3 +100,47 @@ impl SpatialNeighborGrid {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::topology::ProteinTopology;
+    use std::collections::HashSet;
+
+    #[test]
+    fn morton_encode_interleaves_xyz_bits() {
+        assert_eq!(morton_encode_3d(1, 0, 0), 1);
+        assert_eq!(morton_encode_3d(0, 1, 0), 2);
+        assert_eq!(morton_encode_3d(0, 0, 1), 4);
+        assert_eq!(morton_encode_3d(1, 1, 1), 7);
+        assert_eq!(morton_encode_3d(2, 0, 0), 8);
+    }
+
+    #[test]
+    fn spatial_grid_visits_all_true_cutoff_neighbors_and_preserves_permutation() {
+        let (_topo, positions) = ProteinTopology::build_trp_cage_seed();
+        let cutoff = 8.0f32;
+        let cutoff_sq = cutoff * cutoff;
+        let grid = SpatialNeighborGrid::build(&positions, cutoff);
+
+        let mut order = grid.morton_order().to_vec();
+        order.sort_unstable();
+        let expected_indices: Vec<usize> = (0..positions.len()).collect();
+        assert_eq!(order, expected_indices);
+
+        for (i, pi) in positions.iter().enumerate() {
+            let mut visited = HashSet::new();
+            grid.for_each_neighbor(*pi, |j| {
+                visited.insert(j);
+            });
+            for (j, pj) in positions.iter().enumerate() {
+                let dx = pi[0] - pj[0];
+                let dy = pi[1] - pj[1];
+                let dz = pi[2] - pj[2];
+                if dx * dx + dy * dy + dz * dz <= cutoff_sq {
+                    assert!(visited.contains(&j), "missing pair ({i}, {j}) within {cutoff} A");
+                }
+            }
+        }
+    }
+}

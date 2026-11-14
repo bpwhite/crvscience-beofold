@@ -70,6 +70,7 @@ pub fn probe_gpu_adapter() -> Option<GpuAdapterSummary> {
         power_preference: wgpu::PowerPreference::HighPerformance,
         compatible_surface: None,
         force_fallback_adapter: false,
+        apply_limit_buckets: false,
     }))
     .ok()?;
 
@@ -109,6 +110,7 @@ impl GpuForceEngine {
             power_preference: wgpu::PowerPreference::HighPerformance,
             compatible_surface: None,
             force_fallback_adapter: false,
+            apply_limit_buckets: false,
         }))
         .map_err(|_| GpuComputeError::NoAdapter)?;
 

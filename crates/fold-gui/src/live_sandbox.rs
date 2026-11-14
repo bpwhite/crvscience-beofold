@@ -41,6 +41,7 @@ pub struct RungSnapshot {
 }
 
 /// Thread-safe live folding state displayed in the 3D viewport, thermodynamic charts, and MSM studio.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct LiveFoldingState {
     pub topology: Arc<ProteinTopology>,

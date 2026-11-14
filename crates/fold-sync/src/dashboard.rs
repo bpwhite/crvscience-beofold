@@ -226,3 +226,89 @@ fn escape_json(s: &str) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fold_physics::{initialize_clone_checkpoint, minimize_steric_clashes};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TempDirGuard(PathBuf);
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn query_parser_and_embedded_dashboard_html() {
+        assert_eq!(
+            parse_project_id_query("/api/v1/public/conformation/best?project_id=42"),
+            Some(42)
+        );
+        assert_eq!(
+            parse_project_id_query("/api?foo=1&project_id=7&bar=2"),
+            Some(7)
+        );
+        assert_eq!(parse_project_id_query("/api"), None);
+        assert_eq!(parse_project_id_query("/api?project_id=bad"), None);
+
+        assert!(!PUBLIC_DASHBOARD_HTML.is_empty());
+        assert!(PUBLIC_DASHBOARD_HTML.contains("BeoFold"));
+    }
+
+    #[test]
+    fn best_conformation_json_and_pdb_on_empty_and_seeded_store() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "beofold_dash_test_{}_{}",
+            std::process::id(),
+            nanos
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let _guard = TempDirGuard(dir.clone());
+
+        let store = FoldStore::open(&dir).expect("open store");
+        let empty_json = build_best_conformation_json(&store, None).expect("empty json");
+        assert_eq!(empty_json, "{\"available\":false}\n");
+        assert!(build_best_conformation_pdb(&store, None).expect("empty pdb").is_none());
+
+        let (topo, mut coords) = ProteinTopology::build_trp_cage_seed();
+        minimize_steric_clashes(&topo, &mut coords, 10);
+        let wu = WorkUnitId::new(11, 0, 0, 0);
+        let cp = initialize_clone_checkpoint(&topo, &coords, wu, 300.0, b"dash-test");
+        let manifest = ProjectManifest {
+            project_id: 11,
+            name: "TrpCage Dashboard Test".into(),
+            sequence: topo.sequence_one_letter.clone(),
+            topology_blake3: [0u8; 32],
+            initial_coords_blake3: [0u8; 32],
+            atom_count: topo.atoms.len() as u32,
+            residue_count: topo.residue_count,
+            temp_ladder_kelvin: vec![300.0],
+            dt_fs: 1.0,
+            friction_per_ps: 1.0,
+            steps_per_gen: 100,
+            num_clones_per_run: 1,
+            max_generations: 2,
+        };
+        store
+            .seed_project(manifest, &topo, &[cp])
+            .expect("seed project");
+
+        let seeded_json = build_best_conformation_json(&store, Some(11)).expect("seeded json");
+        assert!(seeded_json.contains("\"available\": true"));
+        assert!(seeded_json.contains("\"source_stage\": \"seeded_gen0_conformation\""));
+
+        let (filename, pdb_text) = build_best_conformation_pdb(&store, Some(11))
+            .expect("seeded pdb")
+            .expect("expected Some pdb");
+        assert!(filename.ends_with(".pdb"));
+        assert!(pdb_text.contains("ATOM"));
+    }
+}

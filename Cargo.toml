@@ -14,8 +14,6 @@ members = [
 version = "1.4.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-authors = ["Bryan P. White"]
-description = "BeoFold: Pure-Rust distributed Beowulf & multi-cluster protein structure folding engine"
 
 [workspace.dependencies]
 axum = "0.8"
