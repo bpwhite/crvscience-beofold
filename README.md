@@ -1,5 +1,7 @@
 # BeoFold (`v1.4.0`) — Pure-Rust Distributed Beowulf & Multi-Cluster Protein Folding Engine
 
+![BeoFold Headless Workbench](validation/headless_screenshot.png)
+
 BeoFold is a 100% pure-Rust distributed molecular dynamics, protein structure folding, and Markov State Model (`MSM`) kinetic analysis platform built for heterogeneous Windows and Linux home Beowulf clusters, desktop supervisor visualization, and Apache HTTP multi-cluster WAN federation.
 
 ## Workspace Crate Architecture

@@ -1,3 +1,18 @@
+// Copyright (C) 2026 CRV Science Network (https://crvscience.com)
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://gnu.org>.
+
 use crate::live_sandbox::{LiveFoldingState, SandboxCommand};
 use crate::viewport3d::ConformationViewport;
 use egui::{
@@ -143,6 +158,34 @@ impl MsmLandscapeTab {
                 }
             })
             .ok();
+    }
+
+    pub(crate) fn compute_live_msm_blocking(
+        &mut self,
+        live: &LiveFoldingState,
+        sandbox_tx: &mpsc::Sender<SandboxCommand>,
+    ) -> Result<(), String> {
+        let raw_frames: Vec<ConformationalFrame> = live.msm_frames.iter().cloned().collect();
+        if raw_frames.len() < 8 {
+            return Err(format!(
+                "Need >= 8 conformations for live MSM, found {}",
+                raw_frames.len()
+            ));
+        }
+        let topo = live.topology.clone();
+        let steps_per_gen = live.steps_per_slice_active.max(50);
+        let bundle = build_msm_from_live_frames(
+            topo,
+            raw_frames,
+            steps_per_gen,
+            self.num_microstates,
+            self.num_macrostates,
+            self.lag_generations.max(1),
+            self.ref_temp_kelvin,
+        )?;
+        self.active_bundle = Some(bundle);
+        self.select_macrostate_and_sync(0, sandbox_tx);
+        Ok(())
     }
 
     fn spawn_vault_msm(&mut self, vault_dir: PathBuf) {
@@ -449,7 +492,7 @@ impl MsmLandscapeTab {
         // 2. Right Panel: Interactive 3D Conformation Preview + Implied Relaxation Timescales
         egui::SidePanel::right("msm_right_inspector")
             .resizable(true)
-            .default_width(370.0)
+            .default_width(410.0)
             .show(ctx, |ui| {
                 if let Some(ref bundle) = self.active_bundle {
                     let frame_idx = self

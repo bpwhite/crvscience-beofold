@@ -1,3 +1,18 @@
+// Copyright (C) 2026 CRV Science Network (https://crvscience.com)
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://gnu.org>.
+
 use crate::lan_client::{
     spawn_network_telemetry_thread, NetworkTelemetryState, PollerTargets,
 };
@@ -8,7 +23,10 @@ use crate::msm_tab::MsmLandscapeTab;
 use crate::plots::draw_scientific_trace;
 use crate::viewport3d::{ConformationViewport, RenderRepresentation};
 use egui::{Color32, RichText};
-use fold_proto::ComputeTier;
+use fold_proto::{
+    ClusterStateSnapshot, ComputeTier, GlobalFederationTelemetry, LivePeerStatus,
+    NodeCapabilityProfile, PeerEndpoint, RegisteredClusterRecord, WorkUnitId,
+};
 use fold_storage::to_hex;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -59,10 +77,14 @@ pub struct BeoFoldGuiApp {
 
 impl BeoFoldGuiApp {
     pub fn new(cc: &eframe::CreationContext<'_>, cfg: GuiLaunchConfig) -> Self {
+        Self::new_with_ctx(&cc.egui_ctx, cfg)
+    }
+
+    pub fn new_with_ctx(ctx: &egui::Context, cfg: GuiLaunchConfig) -> Self {
         let mut visuals = egui::Visuals::dark();
         visuals.panel_fill = Color32::from_rgb(15, 20, 28);
         visuals.window_fill = Color32::from_rgb(18, 24, 34);
-        cc.egui_ctx.set_visuals(visuals);
+        ctx.set_visuals(visuals);
 
         let initial_targets = PollerTargets {
             lan_peer: cfg.lan_peer.trim().parse::<SocketAddr>().ok(),
@@ -717,8 +739,218 @@ impl BeoFoldGuiApp {
     }
 }
 
-impl eframe::App for BeoFoldGuiApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+impl BeoFoldGuiApp {
+    pub fn populate_for_screenshot(&mut self, view: u8) {
+        let rounds = if view == 2 { 24 } else { 10 };
+        let _ = self
+            .sandbox_tx
+            .send(SandboxCommand::RunBurstRounds { rounds });
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(25) {
+            let ready = self
+                .live_state
+                .lock()
+                .map(|g| {
+                    g.rungs
+                        .first()
+                        .map(|r| r.generation >= rounds)
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            if ready {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+
+        match view {
+            2 => {
+                self.active_tab = WorkspaceTab::MsmFreeEnergyFlux;
+                self.msm_tab.min_flux_threshold = 0.001;
+                let live_snap = self.live_state.lock().map(|g| g.clone()).ok();
+                if let Some(live) = live_snap {
+                    let _ = self
+                        .msm_tab
+                        .compute_live_msm_blocking(&live, &self.sandbox_tx);
+                }
+            }
+            3 => {
+                self.active_tab = WorkspaceTab::GlobalWanFederation;
+                self.lan_peer_input = "192.168.1.10:7443".to_string();
+                self.wan_sync_url_input = "https://fold.crvscience.org/beofold/api/v1".to_string();
+                let (best_wu, best_e) = self
+                    .live_state
+                    .lock()
+                    .map(|g| (g.best_wu, g.best_potential_kcal))
+                    .unwrap_or((WorkUnitId::new(1, 0, 0, 10), -112.40));
+                if let Ok(mut net) = self.net_state.lock() {
+                    net.lan_target = self.lan_peer_input.clone();
+                    net.lan_connected = true;
+                    net.lan_last_error = None;
+                    net.lan_snapshot = Some(ClusterStateSnapshot {
+                        raft_term: 14,
+                        leader: Some(PeerEndpoint {
+                            node_pubkey: [0xA1; 32],
+                            addr: "192.168.1.10:7443".to_string(),
+                        }),
+                        active_project_id: Some(1),
+                        active_project_name: Some("Trp-Cage (1L2Y) MREMD".to_string()),
+                        peers: vec![
+                            LivePeerStatus {
+                                capability: NodeCapabilityProfile {
+                                    node_pubkey: [0xA1; 32],
+                                    hostname: "helix-gpu-01".to_string(),
+                                    os: "windows".to_string(),
+                                    arch: "x86_64".to_string(),
+                                    logical_cores: 24,
+                                    total_ram_mb: 65_536,
+                                    villin_ns_per_day: 68.40,
+                                    tier: ComputeTier::TierS,
+                                },
+                                addr: "192.168.1.10:7443".to_string(),
+                                active_wu: Some(WorkUnitId::new(1, 0, 0, 11)),
+                                step_progress: 740_000,
+                                target_steps: 1_000_000,
+                                current_pot_kcal: best_e,
+                                cpu_usage_pct: 64.0,
+                                throttled: false,
+                                last_seen_unix_sec: 1_763_180_000,
+                            },
+                            LivePeerStatus {
+                                capability: NodeCapabilityProfile {
+                                    node_pubkey: [0xB2; 32],
+                                    hostname: "rack-epyc-02".to_string(),
+                                    os: "linux".to_string(),
+                                    arch: "x86_64".to_string(),
+                                    logical_cores: 32,
+                                    total_ram_mb: 131_072,
+                                    villin_ns_per_day: 29.15,
+                                    tier: ComputeTier::TierA,
+                                },
+                                addr: "192.168.1.11:7443".to_string(),
+                                active_wu: Some(WorkUnitId::new(1, 0, 1, 11)),
+                                step_progress: 185_000,
+                                target_steps: 250_000,
+                                current_pot_kcal: best_e + 4.82,
+                                cpu_usage_pct: 91.0,
+                                throttled: false,
+                                last_seen_unix_sec: 1_763_180_000,
+                            },
+                            LivePeerStatus {
+                                capability: NodeCapabilityProfile {
+                                    node_pubkey: [0xC3; 32],
+                                    hostname: "studio-m3-03".to_string(),
+                                    os: "macos".to_string(),
+                                    arch: "aarch64".to_string(),
+                                    logical_cores: 14,
+                                    total_ram_mb: 32_768,
+                                    villin_ns_per_day: 19.60,
+                                    tier: ComputeTier::TierA,
+                                },
+                                addr: "192.168.1.12:7443".to_string(),
+                                active_wu: Some(WorkUnitId::new(1, 0, 2, 11)),
+                                step_progress: 162_500,
+                                target_steps: 250_000,
+                                current_pot_kcal: best_e + 9.15,
+                                cpu_usage_pct: 78.0,
+                                throttled: false,
+                                last_seen_unix_sec: 1_763_180_000,
+                            },
+                            LivePeerStatus {
+                                capability: NodeCapabilityProfile {
+                                    node_pubkey: [0xD4; 32],
+                                    hostname: "lab-nuc-04".to_string(),
+                                    os: "linux".to_string(),
+                                    arch: "x86_64".to_string(),
+                                    logical_cores: 8,
+                                    total_ram_mb: 16_384,
+                                    villin_ns_per_day: 6.45,
+                                    tier: ComputeTier::TierB,
+                                },
+                                addr: "192.168.1.13:7443".to_string(),
+                                active_wu: Some(WorkUnitId::new(1, 0, 3, 11)),
+                                step_progress: 34_000,
+                                target_steps: 50_000,
+                                current_pot_kcal: best_e + 14.30,
+                                cpu_usage_pct: 82.0,
+                                throttled: false,
+                                last_seen_unix_sec: 1_763_180_000,
+                            },
+                        ],
+                        total_workunits: 128,
+                        queued_workunits: 40,
+                        leased_workunits: 4,
+                        completed_workunits: 84,
+                        mremd_swaps: 42,
+                        mremd_trials: 112,
+                        quarantined_events: 0,
+                        lowest_potential_kcal: Some((best_wu, best_e)),
+                    });
+
+                    let cluster_specs = [
+                        ("crv-pacific-core", 0xA1_u8, 6, 3, 2, 1, 148.60, "win64/linux_x86_64", true, 412_u64, 0_u64),
+                        ("stanford-fold-lab", 0xB2, 8, 4, 3, 1, 184.20, "linux_x86_64", true, 528, 0),
+                        ("zurich-eth-biocomp", 0xC3, 5, 2, 2, 1, 102.45, "linux_x86_64", true, 319, 0),
+                        ("kyoto-riken-arm", 0xD4, 6, 1, 4, 1, 76.90, "linux_aarch64", true, 244, 0),
+                        ("boston-biotech-gpu", 0xE5, 4, 3, 1, 0, 134.80, "win64/linux", true, 381, 0),
+                        ("austin-tacc-epyc", 0xF6, 7, 1, 5, 1, 91.15, "linux_x86_64", false, 198, 1),
+                        ("berlin-mpi-cluster", 0x17, 4, 1, 2, 1, 58.30, "linux_x86_64", true, 176, 0),
+                        ("toronto-vector-node", 0x28, 3, 2, 1, 0, 88.75, "linux_x86_64", true, 265, 0),
+                        ("cambridge-biomesh", 0x39, 5, 1, 3, 1, 64.40, "linux/macos", false, 142, 0),
+                        ("seattle-garage-rack", 0x4A, 4, 1, 2, 1, 51.20, "win64", true, 129, 0),
+                        ("tokyo-home-m3max", 0x5B, 3, 0, 2, 1, 34.85, "macos_aarch64", false, 94, 1),
+                        ("sydney-unsw-grid", 0x6C, 4, 1, 2, 1, 47.60, "linux_x86_64", false, 118, 0),
+                    ];
+                    let clusters: Vec<RegisteredClusterRecord> = cluster_specs
+                        .iter()
+                        .map(|&(name, kb, tot, ts, ta, tb, rate, os, trusted, done, quar)| {
+                            RegisteredClusterRecord {
+                                cluster_pubkey: [kb; 32],
+                                cluster_name: name.to_string(),
+                                total_nodes: tot,
+                                tier_s_nodes: ts,
+                                tier_a_nodes: ta,
+                                tier_b_nodes: tb,
+                                aggregate_ns_per_day: rate,
+                                os_summary: os.to_string(),
+                                trusted,
+                                completed_units: done,
+                                quarantined_units: quar,
+                                last_seen_unix_sec: 1_763_180_000,
+                            }
+                        })
+                        .collect();
+                    let agg_rate: f64 = clusters.iter().map(|c| c.aggregate_ns_per_day).sum();
+                    net.wan_sync_url = self.wan_sync_url_input.clone();
+                    net.wan_connected = true;
+                    net.wan_last_error = None;
+                    net.wan_snapshot = Some(GlobalFederationTelemetry {
+                        server_unix_sec: 1_763_180_000,
+                        quorum_mode: 2,
+                        clusters,
+                        aggregate_ns_per_day: agg_rate,
+                        active_projects: vec![1, 2],
+                        total_workunits: 3600,
+                        queued_workunits: 512,
+                        leased_workunits: 64,
+                        quorum_pending_workunits: 18,
+                        completed_workunits: 3006,
+                        mremd_swaps: 1420,
+                        mremd_trials: 3890,
+                        quarantined_events: 2,
+                        canary_audits_passed: 284,
+                        lowest_potential_kcal: Some((best_wu, best_e)),
+                    });
+                }
+            }
+            _ => {
+                self.active_tab = WorkspaceTab::FoldingStudio3D;
+                self.viewport.show_best_conformation = true;
+            }
+        }
+    }
+
+    pub fn render_ui(&mut self, ctx: &egui::Context) {
         let net_snap = self
             .net_state
             .lock()
@@ -767,6 +999,12 @@ impl eframe::App for BeoFoldGuiApp {
         } else {
             ctx.request_repaint_after(Duration::from_millis(500));
         }
+    }
+}
+
+impl eframe::App for BeoFoldGuiApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.render_ui(ctx);
     }
 }
 
