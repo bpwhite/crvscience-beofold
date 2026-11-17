@@ -135,18 +135,19 @@ pub fn draw_scientific_trace(
     }
 
     let latest = *series.back().unwrap_or(&0.0);
+    let compact_title = title.split(" (").next().unwrap_or(title);
     painter.text(
         Pos2::new(rect.left() + 10.0, rect.top() + 5.0),
         Align2::LEFT_TOP,
-        format!("{}: {:.2} {}", title, latest, unit),
-        FontId::monospace(11.5),
+        format!("{}: {:.2} {}", compact_title, latest, unit),
+        FontId::monospace(11.0),
         Color32::from_rgb(226, 232, 240),
     );
     painter.text(
-        Pos2::new(rect.right() - 10.0, rect.top() + 5.0),
-        Align2::RIGHT_TOP,
+        Pos2::new(rect.right() - 10.0, rect.bottom() - 4.0),
+        Align2::RIGHT_BOTTOM,
         format!("min {:.2} | max {:.2}", y_min, y_max),
-        FontId::monospace(10.5),
+        FontId::monospace(10.0),
         Color32::from_rgb(148, 163, 184),
     );
 

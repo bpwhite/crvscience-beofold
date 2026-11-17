@@ -61,6 +61,8 @@ pub struct RungSnapshot {
 pub struct LiveFoldingState {
     pub topology: Arc<ProteinTopology>,
     pub seed_positions: Vec<[f32; 3]>,
+    pub seed_potential_kcal: f64,
+    pub seed_rg_angstrom: f64,
     pub current_positions: Vec<[f32; 3]>,
     pub best_positions: Vec<[f32; 3]>,
     pub best_potential_kcal: f64,
@@ -181,6 +183,8 @@ impl LiveFoldingState {
         Self {
             topology: Arc::new(topo),
             seed_positions: seed_coords.clone(),
+            seed_potential_kcal: e0,
+            seed_rg_angstrom: rg0,
             current_positions: seed_coords.clone(),
             best_positions: seed_coords,
             best_potential_kcal: e0,

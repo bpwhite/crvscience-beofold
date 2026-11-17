@@ -71,6 +71,7 @@ pub struct BeoFoldGuiApp {
     live_state: Arc<Mutex<LiveFoldingState>>,
     sandbox_tx: mpsc::Sender<SandboxCommand>,
     viewport: ConformationViewport,
+    compare_start_vs_folded: bool,
     msm_tab: MsmLandscapeTab,
     last_export_msg: Option<String>,
 }
@@ -126,6 +127,7 @@ impl BeoFoldGuiApp {
             live_state,
             sandbox_tx,
             viewport: ConformationViewport::default(),
+            compare_start_vs_folded: false,
             msm_tab: MsmLandscapeTab::default(),
             last_export_msg: None,
         }
@@ -331,6 +333,10 @@ impl BeoFoldGuiApp {
                             self.viewport.reset_camera();
                         }
                     });
+                    ui.checkbox(
+                        &mut self.compare_start_vs_folded,
+                        "Side-by-Side: Unfolded Start vs. Folded End",
+                    );
 
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
@@ -477,23 +483,103 @@ impl BeoFoldGuiApp {
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            let coords = if self.viewport.show_best_conformation {
-                &live.best_positions
+            if self.compare_start_vs_folded {
+                let max_radius = |pts: &[[f32; 3]]| -> f32 {
+                    if pts.is_empty() {
+                        return 6.0;
+                    }
+                    let inv = 1.0 / (pts.len() as f32);
+                    let mut mx = 0.0f32;
+                    let mut my = 0.0f32;
+                    let mut mz = 0.0f32;
+                    for p in pts {
+                        mx += p[0] * inv;
+                        my += p[1] * inv;
+                        mz += p[2] * inv;
+                    }
+                    let mut r_max = 6.0f32;
+                    for p in pts {
+                        let d = ((p[0] - mx).powi(2) + (p[1] - my).powi(2) + (p[2] - mz).powi(2)).sqrt();
+                        if d > r_max {
+                            r_max = d;
+                        }
+                    }
+                    r_max
+                };
+                let unfolded_sub = format!(
+                    "START (t=0 Unfolded) | Rg={:.2} A | V={:.1}",
+                    live.seed_rg_angstrom, live.seed_potential_kcal
+                );
+                let cold_rung = live.rungs.iter().min_by(|a, b| {
+                    a.temperature_kelvin
+                        .partial_cmp(&b.temperature_kelvin)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let (right_coords, folded_sub) = if self.viewport.show_best_conformation {
+                    (
+                        &live.best_positions,
+                        format!(
+                            "FOLDED (Low-E {}) | Rg={:.2} A | V={:.1}",
+                            live.best_wu, live.best_rg_angstrom, live.best_potential_kcal
+                        ),
+                    )
+                } else if let Some(r) = cold_rung {
+                    (
+                        &live.current_positions,
+                        format!(
+                            "FOLDING END (G{}) | Rg={:.2} A | RMSD={:.1} A",
+                            r.generation, r.rg_angstrom, r.rmsd_seed_ang
+                        ),
+                    )
+                } else {
+                    (
+                        &live.current_positions,
+                        format!(
+                            "FOLDING END | Rg={:.2} A | V={:.1}",
+                            live.best_rg_angstrom, live.best_potential_kcal
+                        ),
+                    )
+                };
+                let shared_extent = max_radius(&live.seed_positions)
+                    .max(max_radius(right_coords))
+                    * 1.12;
+                let mut right_vp = self.viewport.clone();
+                right_vp.auto_spin = false;
+                ui.columns(2, |cols| {
+                    self.viewport.ui_with_scale(
+                        &mut cols[0],
+                        &live.topology,
+                        &live.seed_positions,
+                        &unfolded_sub,
+                        Some(shared_extent),
+                    );
+                    right_vp.ui_with_scale(
+                        &mut cols[1],
+                        &live.topology,
+                        right_coords,
+                        &folded_sub,
+                        Some(shared_extent),
+                    );
+                });
             } else {
-                &live.current_positions
-            };
-            let mode_str = if self.viewport.show_best_conformation {
-                format!(
-                    "Lowest-Energy Conformation {} ({:.2} kcal/mol)",
-                    live.best_wu, live.best_potential_kcal
-                )
-            } else {
-                format!(
-                    "Active Conformation {} ({:.2} kcal/mol)",
-                    live.best_wu, live.best_potential_kcal
-                )
-            };
-            self.viewport.ui(ui, &live.topology, coords, &mode_str);
+                let coords = if self.viewport.show_best_conformation {
+                    &live.best_positions
+                } else {
+                    &live.current_positions
+                };
+                let mode_str = if self.viewport.show_best_conformation {
+                    format!(
+                        "Lowest-Energy Conformation {} ({:.2} kcal/mol)",
+                        live.best_wu, live.best_potential_kcal
+                    )
+                } else {
+                    format!(
+                        "Active Conformation {} ({:.2} kcal/mol)",
+                        live.best_wu, live.best_potential_kcal
+                    )
+                };
+                self.viewport.ui(ui, &live.topology, coords, &mode_str);
+            }
         });
     }
 
@@ -741,7 +827,11 @@ impl BeoFoldGuiApp {
 
 impl BeoFoldGuiApp {
     pub fn populate_for_screenshot(&mut self, view: u8) {
-        let rounds = if view == 2 { 24 } else { 10 };
+        let rounds = match view {
+            2 => 24,
+            3 => 10,
+            _ => 220,
+        };
         let _ = self
             .sandbox_tx
             .send(SandboxCommand::RunBurstRounds { rounds });
@@ -945,7 +1035,10 @@ impl BeoFoldGuiApp {
             }
             _ => {
                 self.active_tab = WorkspaceTab::FoldingStudio3D;
-                self.viewport.show_best_conformation = true;
+                self.compare_start_vs_folded = true;
+                self.viewport.show_best_conformation = false;
+                self.viewport.auto_spin = false;
+                self.viewport.zoom = 1.18;
             }
         }
     }

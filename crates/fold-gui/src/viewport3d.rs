@@ -93,6 +93,17 @@ impl ConformationViewport {
         positions: &[[f32; 3]],
         subtitle: &str,
     ) {
+        self.ui_with_scale(ui, topology, positions, subtitle, None);
+    }
+
+    pub fn ui_with_scale(
+        &mut self,
+        ui: &mut Ui,
+        topology: &ProteinTopology,
+        positions: &[[f32; 3]],
+        subtitle: &str,
+        extent_override: Option<f32>,
+    ) {
         let avail = ui.available_size();
         let canvas_size = Vec2::new(avail.x.max(280.0), (avail.y - 4.0).max(260.0));
         let (response, painter) = ui.allocate_painter(canvas_size, Sense::click_and_drag());
@@ -166,8 +177,9 @@ impl ConformationViewport {
 
         let (sy, cy_ang) = self.yaw_rad.sin_cos();
         let (sp, cp_ang) = self.pitch_rad.sin_cos();
-        let cam_dist = max_extent * 3.1;
-        let base_scale = rect.width().min(rect.height()) * 0.40 * self.zoom / max_extent.max(1.0);
+        let scale_extent = extent_override.unwrap_or(max_extent).max(1.0);
+        let cam_dist = scale_extent * 3.1;
+        let base_scale = rect.width().min(rect.height()) * 0.40 * self.zoom / scale_extent;
         let screen_origin = rect.center() + self.pan;
 
         // Project every atom into `(screen_pos, view_z, perspective_factor)`
@@ -367,27 +379,56 @@ impl ConformationViewport {
         }
 
         // HUD overlay legend & camera hint
-        painter.text(
-            Pos2::new(rect.left() + 12.0, rect.top() + 10.0),
-            Align2::LEFT_TOP,
-            format!(
-                "{} ({} aa, {} atoms) — {}",
-                topology.name,
-                topology.residue_count,
-                topology.atoms.len(),
-                subtitle
-            ),
-            FontId::monospace(12.0),
-            Color32::from_rgb(226, 232, 240),
-        );
+        if rect.width() < 560.0 {
+            painter.text(
+                Pos2::new(rect.left() + 10.0, rect.top() + 8.0),
+                Align2::LEFT_TOP,
+                subtitle,
+                FontId::monospace(11.0),
+                Color32::from_rgb(226, 232, 240),
+            );
+            painter.text(
+                Pos2::new(rect.left() + 10.0, rect.top() + 23.0),
+                Align2::LEFT_TOP,
+                format!(
+                    "{} ({} aa, {} atoms)",
+                    topology.name,
+                    topology.residue_count,
+                    topology.atoms.len()
+                ),
+                FontId::monospace(10.0),
+                Color32::from_rgb(148, 163, 184),
+            );
+            painter.text(
+                Pos2::new(rect.left() + 10.0, rect.bottom() - 18.0),
+                Align2::LEFT_TOP,
+                "Gold: Hydrophobic | Sky: +K/R | Coral: -D/E | Teal: Polar",
+                FontId::monospace(9.5),
+                Color32::from_rgb(148, 163, 184),
+            );
+        } else {
+            painter.text(
+                Pos2::new(rect.left() + 12.0, rect.top() + 10.0),
+                Align2::LEFT_TOP,
+                format!(
+                    "{} ({} aa, {} atoms) — {}",
+                    topology.name,
+                    topology.residue_count,
+                    topology.atoms.len(),
+                    subtitle
+                ),
+                FontId::monospace(12.0),
+                Color32::from_rgb(226, 232, 240),
+            );
 
-        painter.text(
-            Pos2::new(rect.left() + 12.0, rect.bottom() - 22.0),
-            Align2::LEFT_TOP,
-            "Gold: Hydrophobic Core  |  Sky: Basic (+K/R)  |  Coral: Acidic (-D/E)  |  Teal: Polar  |  Left-Drag: Orbit  Scroll: Zoom",
-            FontId::monospace(10.5),
-            Color32::from_rgb(148, 163, 184),
-        );
+            painter.text(
+                Pos2::new(rect.left() + 12.0, rect.bottom() - 22.0),
+                Align2::LEFT_TOP,
+                "Gold: Hydrophobic Core  |  Sky: Basic (+K/R)  |  Coral: Acidic (-D/E)  |  Teal: Polar  |  Left-Drag: Orbit  Scroll: Zoom",
+                FontId::monospace(10.5),
+                Color32::from_rgb(148, 163, 184),
+            );
+        }
 
         // Interactive atom/residue tooltip on hover
         if let Some((idx, scr)) = hovered_atom {
