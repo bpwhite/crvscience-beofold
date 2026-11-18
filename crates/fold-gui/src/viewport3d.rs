@@ -378,16 +378,18 @@ impl ConformationViewport {
             }
         }
 
-        // HUD overlay legend & camera hint
-        if rect.width() < 560.0 {
-            painter.text(
+        // HUD overlay legend & camera hint (clipped to rect and responsive across all panel widths)
+        let hud_painter = painter.with_clip_rect(rect);
+        let legend_layout = compute_hud_legend_layout(rect.width());
+        let header_bottom_y = if legend_layout.two_line_header {
+            hud_painter.text(
                 Pos2::new(rect.left() + 10.0, rect.top() + 8.0),
                 Align2::LEFT_TOP,
                 subtitle,
                 FontId::monospace(11.0),
                 Color32::from_rgb(226, 232, 240),
             );
-            painter.text(
+            hud_painter.text(
                 Pos2::new(rect.left() + 10.0, rect.top() + 23.0),
                 Align2::LEFT_TOP,
                 format!(
@@ -399,15 +401,9 @@ impl ConformationViewport {
                 FontId::monospace(10.0),
                 Color32::from_rgb(148, 163, 184),
             );
-            painter.text(
-                Pos2::new(rect.left() + 10.0, rect.bottom() - 18.0),
-                Align2::LEFT_TOP,
-                "Gold: Hydrophobic | Sky: +K/R | Coral: -D/E | Teal: Polar",
-                FontId::monospace(9.5),
-                Color32::from_rgb(148, 163, 184),
-            );
+            rect.top() + 37.0
         } else {
-            painter.text(
+            hud_painter.text(
                 Pos2::new(rect.left() + 12.0, rect.top() + 10.0),
                 Align2::LEFT_TOP,
                 format!(
@@ -420,33 +416,91 @@ impl ConformationViewport {
                 FontId::monospace(12.0),
                 Color32::from_rgb(226, 232, 240),
             );
+            rect.top() + 26.0
+        };
 
-            painter.text(
-                Pos2::new(rect.left() + 12.0, rect.bottom() - 22.0),
+        let legend_y = rect.bottom() - legend_layout.bottom_offset;
+        for (line_idx, line) in legend_layout.legend_lines.iter().enumerate() {
+            hud_painter.text(
+                Pos2::new(
+                    rect.left() + legend_layout.pad_x,
+                    legend_y + (line_idx as f32) * 12.5,
+                ),
                 Align2::LEFT_TOP,
-                "Gold: Hydrophobic Core  |  Sky: Basic (+K/R)  |  Coral: Acidic (-D/E)  |  Teal: Polar  |  Left-Drag: Orbit  Scroll: Zoom",
-                FontId::monospace(10.5),
+                *line,
+                FontId::monospace(legend_layout.font_size),
                 Color32::from_rgb(148, 163, 184),
             );
         }
 
-        // Interactive atom/residue tooltip on hover
+        // Interactive atom/residue tooltip on hover (positioned cleanly below header)
         if let Some((idx, scr)) = hovered_atom {
             let a = &topology.atoms[idx];
             let p = positions[idx];
-            painter.circle_stroke(scr, 10.0, Stroke::new(1.8_f32, Color32::WHITE));
+            hud_painter.circle_stroke(scr, 10.0, Stroke::new(1.8_f32, Color32::WHITE));
             let tip = format!(
                 "{}{} {} (#{}) | ({:.2}, {:.2}, {:.2}) A | q={:+.2}e | sigma={:.2}A",
                 a.res_name, a.res_seq, a.name, a.serial, p[0], p[1], p[2], a.charge_e, a.lj_sigma_ang
             );
-            let tip_pos = Pos2::new(rect.left() + 12.0, rect.top() + 30.0);
-            painter.text(
+            let tip_pos = Pos2::new(rect.left() + 12.0, header_bottom_y + 4.0);
+            hud_painter.text(
                 tip_pos,
                 Align2::LEFT_TOP,
                 tip,
-                FontId::monospace(11.5),
+                FontId::monospace(11.0),
                 Color32::from_rgb(56, 189, 248),
             );
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct HudLegendLayout {
+    pub two_line_header: bool,
+    pub pad_x: f32,
+    pub bottom_offset: f32,
+    pub font_size: f32,
+    pub legend_lines: Vec<&'static str>,
+    pub estimated_max_line_px: f32,
+}
+
+pub(crate) fn compute_hud_legend_layout(rect_width: f32) -> HudLegendLayout {
+    if rect_width >= 760.0 {
+        let line = "Gold: Hydrophobic Core  |  Sky: Basic (+K/R)  |  Coral: Acidic (-D/E)  |  Teal: Polar  |  Drag: Orbit  Scroll: Zoom";
+        let font_size = 10.0;
+        let est = (line.len() as f32) * (font_size * 0.60);
+        HudLegendLayout {
+            two_line_header: false,
+            pad_x: 12.0,
+            bottom_offset: 22.0,
+            font_size,
+            legend_lines: vec![line],
+            estimated_max_line_px: est,
+        }
+    } else if rect_width >= 380.0 {
+        let line = "Gold: Hydrophobic | Sky: +K/R | Coral: -D/E | Teal: Polar";
+        let font_size = 9.5;
+        let est = (line.len() as f32) * (font_size * 0.60);
+        HudLegendLayout {
+            two_line_header: true,
+            pad_x: 10.0,
+            bottom_offset: 18.0,
+            font_size,
+            legend_lines: vec![line],
+            estimated_max_line_px: est,
+        }
+    } else {
+        let line1 = "Gold: Hydrophob | Sky: +K/R";
+        let line2 = "Coral: -D/E | Teal: Polar";
+        let font_size = 9.0;
+        let max_chars = line1.len().max(line2.len()) as f32;
+        HudLegendLayout {
+            two_line_header: true,
+            pad_x: 10.0,
+            bottom_offset: 30.0,
+            font_size,
+            legend_lines: vec![line1, line2],
+            estimated_max_line_px: max_chars * (font_size * 0.60),
         }
     }
 }
@@ -507,4 +561,22 @@ fn depth_cue_color(c: Color32, z: f32, max_extent: f32) -> Color32 {
 #[inline]
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hud_legend_fits_within_viewport_bounds_across_all_width_tiers() {
+        for width in [280.0_f32, 340.0, 394.0, 440.0, 580.0, 715.0, 760.0, 1024.0] {
+            let layout = compute_hud_legend_layout(width);
+            assert!(
+                layout.pad_x * 2.0 + layout.estimated_max_line_px <= width + 4.0,
+                "legend overflow at width={width}: est={} pad_x={}",
+                layout.estimated_max_line_px,
+                layout.pad_x
+            );
+        }
+    }
 }

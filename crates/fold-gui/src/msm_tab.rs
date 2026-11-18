@@ -57,6 +57,7 @@ pub struct MsmLandscapeTab {
     pub num_macrostates: usize,
     pub lag_generations: u32,
     pub ref_temp_kelvin: f64,
+    pub cold_rung_filter_only: bool,
     pub project_id_input: u32,
     pub show_flux_edges: bool,
     pub min_flux_threshold: f32,
@@ -82,6 +83,7 @@ impl Default for MsmLandscapeTab {
             num_macrostates: 3,
             lag_generations: 1,
             ref_temp_kelvin: 300.0,
+            cold_rung_filter_only: true,
             project_id_input: 1,
             show_flux_edges: true,
             min_flux_threshold: 0.005,
@@ -125,14 +127,16 @@ impl MsmLandscapeTab {
         let m_req = self.num_macrostates;
         let lag = self.lag_generations.max(1);
         let ref_t = self.ref_temp_kelvin;
+        let cold_only = self.cold_rung_filter_only;
         let slot = self.job_slot.clone();
+        let err_slot = slot.clone();
 
         if let Ok(mut g) = slot.lock() {
             g.computing = true;
             g.last_error = None;
         }
 
-        std::thread::Builder::new()
+        if let Err(e) = std::thread::Builder::new()
             .name("beofold-gui-msm-live".into())
             .spawn(move || {
                 let res = build_msm_from_live_frames(
@@ -143,6 +147,7 @@ impl MsmLandscapeTab {
                     m_req,
                     lag,
                     ref_t,
+                    cold_only,
                 );
                 if let Ok(mut g) = slot.lock() {
                     g.computing = false;
@@ -157,7 +162,12 @@ impl MsmLandscapeTab {
                     }
                 }
             })
-            .ok();
+        {
+            if let Ok(mut g) = err_slot.lock() {
+                g.computing = false;
+                g.last_error = Some(format!("Failed to spawn MSM worker: {e}"));
+            }
+        }
     }
 
     pub(crate) fn compute_live_msm_blocking(
@@ -182,6 +192,7 @@ impl MsmLandscapeTab {
             self.num_macrostates,
             self.lag_generations.max(1),
             self.ref_temp_kelvin,
+            self.cold_rung_filter_only,
         )?;
         self.active_bundle = Some(bundle);
         self.select_macrostate_and_sync(0, sandbox_tx);
@@ -194,17 +205,27 @@ impl MsmLandscapeTab {
         let m_req = self.num_macrostates;
         let lag = self.lag_generations.max(1);
         let ref_t = self.ref_temp_kelvin;
+        let cold_only = self.cold_rung_filter_only;
         let slot = self.job_slot.clone();
+        let err_slot = slot.clone();
 
         if let Ok(mut g) = slot.lock() {
             g.computing = true;
             g.last_error = None;
         }
 
-        std::thread::Builder::new()
+        if let Err(e) = std::thread::Builder::new()
             .name("beofold-gui-msm-vault".into())
             .spawn(move || {
-                let res = build_msm_from_redb_vault(&vault_dir, pid, k_req, m_req, lag, ref_t);
+                let res = build_msm_from_redb_vault(
+                    &vault_dir,
+                    pid,
+                    k_req,
+                    m_req,
+                    lag,
+                    ref_t,
+                    cold_only,
+                );
                 if let Ok(mut g) = slot.lock() {
                     g.computing = false;
                     match res {
@@ -218,7 +239,12 @@ impl MsmLandscapeTab {
                     }
                 }
             })
-            .ok();
+        {
+            if let Ok(mut g) = err_slot.lock() {
+                g.computing = false;
+                g.last_error = Some(format!("Failed to spawn vault MSM worker: {e}"));
+            }
+        }
     }
 
     fn select_macrostate_and_sync(
@@ -234,10 +260,17 @@ impl MsmLandscapeTab {
         };
         let rep_idx = mac.representative_frame_idx;
         let rep_frame = &bundle.frames[rep_idx];
-        let rep_micro = bundle.clustering.frame_assignments[rep_idx];
+        let orig_micro = bundle.clustering.frame_assignments[rep_idx];
+        let active_micro = bundle
+            .msm
+            .orig_to_active
+            .get(orig_micro)
+            .copied()
+            .flatten()
+            .or_else(|| mac.member_microstates.first().copied());
 
         self.selected_macrostate = Some(macro_idx);
-        self.selected_microstate = Some(rep_micro);
+        self.selected_microstate = active_micro;
         self.selected_frame_idx = Some(rep_idx);
         self.single_pdb_out = format!("./macrostate_{}_{}.pdb", mac.macro_id, mac.biophysical_label);
 
@@ -262,7 +295,8 @@ impl MsmLandscapeTab {
         if micro_idx >= bundle.msm.num_microstates {
             return;
         }
-        let medoid_frame_idx = bundle.clustering.medoid_frame_indices[micro_idx];
+        let orig_micro = bundle.msm.active_microstates[micro_idx];
+        let medoid_frame_idx = bundle.clustering.medoid_frame_indices[orig_micro];
         let med_frame = &bundle.frames[medoid_frame_idx];
         let macro_id = bundle.msm.microstate_to_macrostate[micro_idx];
 
@@ -313,7 +347,7 @@ impl MsmLandscapeTab {
         // 1. Left Control & PCCA+ Macrostate Selector Panel
         egui::SidePanel::left("msm_left_controls")
             .resizable(true)
-            .default_width(335.0)
+            .default_width(355.0)
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.heading("Markov State Model Builder");
@@ -344,6 +378,10 @@ impl MsmLandscapeTab {
                         egui::Slider::new(&mut self.ref_temp_kelvin, 275.0..=380.0)
                             .text("Ref Temp (K)"),
                     );
+                    ui.checkbox(
+                        &mut self.cold_rung_filter_only,
+                        "Cold-Rung Filter (T <= T_ref + 25 K)",
+                    );
 
                     ui.add_space(6.0);
                     ui.add_enabled_ui(!is_computing, |ui| {
@@ -369,8 +407,13 @@ impl MsmLandscapeTab {
                         ui.add_space(6.0);
                         ui.horizontal(|ui| {
                             ui.add(
-                                egui::TextEdit::singleline(vault_dir_input).desired_width(175.0),
+                                egui::TextEdit::singleline(vault_dir_input).desired_width(145.0),
                             );
+                            if ui.button("Browse...").clicked() {
+                                if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                                    *vault_dir_input = folder.display().to_string();
+                                }
+                            }
                             if ui.button("Build from redb").clicked() {
                                 self.spawn_vault_msm(PathBuf::from(vault_dir_input.trim()));
                             }
@@ -416,12 +459,17 @@ impl MsmLandscapeTab {
                         let mut clicked_macro: Option<usize> = None;
                         for mac in &bundle_clone.msm.macrostates {
                             let is_sel = self.selected_macrostate == Some(mac.macro_id);
+                            let dg = if mac.free_energy_kcal.abs() < 5e-4 {
+                                0.0
+                            } else {
+                                mac.free_energy_kcal
+                            };
                             let header = format!(
                                 "M{} [{}]  pi={:.1}%  dG={:.2} kcal/mol",
                                 mac.macro_id,
                                 mac.biophysical_label,
                                 mac.stationary_population * 100.0,
-                                mac.free_energy_kcal
+                                dg
                             );
                             let sub = format!(
                                 "   p_fold={:.2} | Rg={:.2} A | RMSD_best={:.2} A | {} microstates",
@@ -450,8 +498,13 @@ impl MsmLandscapeTab {
                         ui.horizontal(|ui| {
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.export_bundle_dir)
-                                    .desired_width(185.0),
+                                    .desired_width(155.0),
                             );
+                            if ui.button("Browse...").clicked() {
+                                if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                                    self.export_bundle_dir = folder.display().to_string();
+                                }
+                            }
                             if ui.button("Export All").clicked() {
                                 let out = PathBuf::from(self.export_bundle_dir.trim());
                                 match export_msm_bundle(
@@ -500,11 +553,28 @@ impl MsmLandscapeTab {
                         .unwrap_or(0)
                         .min(bundle.frames.len().saturating_sub(1));
                     let sel_frame = &bundle.frames[frame_idx];
-                    let micro_id = bundle.clustering.frame_assignments[frame_idx];
-                    let macro_id = bundle.msm.microstate_to_macrostate[micro_id];
+                    let orig_micro_id = bundle.clustering.frame_assignments[frame_idx];
+                    let active_micro_opt = bundle
+                        .msm
+                        .orig_to_active
+                        .get(orig_micro_id)
+                        .copied()
+                        .flatten();
+                    let active_micro_label = active_micro_opt
+                        .map(|a| format!("S{}", a))
+                        .unwrap_or_else(|| format!("S_orig{}", orig_micro_id));
+                    let macro_id = active_micro_opt
+                        .map(|a| bundle.msm.microstate_to_macrostate[a])
+                        .unwrap_or(0);
+                    let p_fold_val = active_micro_opt
+                        .map(|a| bundle.msm.folding_committor[a])
+                        .unwrap_or(0.0);
 
                     ui.horizontal(|ui| {
-                        ui.heading(format!("3D Inspector — M{} / S{}", macro_id, micro_id));
+                        ui.heading(format!(
+                            "3D Inspector — M{} / {}",
+                            macro_id, active_micro_label
+                        ));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui
                                 .button(RichText::new("Open in Full 3D Studio").strong())
@@ -521,7 +591,7 @@ impl MsmLandscapeTab {
                             sel_frame.wu_id,
                             sel_frame.potential_energy_kcal,
                             sel_frame.rg_angstrom,
-                            bundle.msm.folding_committor[micro_id]
+                            p_fold_val
                         ))
                         .monospace()
                         .size(11.0)
@@ -530,20 +600,33 @@ impl MsmLandscapeTab {
 
                     ui.horizontal(|ui| {
                         ui.checkbox(&mut self.preview_viewport.auto_spin, "Auto-Spin");
-                        if ui.button("Save .pdb").clicked() {
-                            let p = PathBuf::from(self.single_pdb_out.trim());
-                            match bundle.topology.write_pdb_snapshot(
-                                &sel_frame.positions_angstrom,
-                                &p,
-                                &format!("MSM Selected M{} S{}", macro_id, micro_id),
-                                sel_frame.potential_energy_kcal,
-                            ) {
-                                Ok(()) => {
-                                    self.status_note =
-                                        Some(format!("Wrote 3D conformation to {}", p.display()));
-                                }
-                                Err(e) => {
-                                    self.status_note = Some(format!("PDB save error: {}", e));
+                        if ui.button("Save .pdb...").clicked() {
+                            let default_name = PathBuf::from(self.single_pdb_out.trim())
+                                .file_name()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("selected_state.pdb")
+                                .to_string();
+                            if let Some(p) = rfd::FileDialog::new()
+                                .add_filter("PDB Structure", &["pdb"])
+                                .set_file_name(&default_name)
+                                .save_file()
+                            {
+                                self.single_pdb_out = p.display().to_string();
+                                match bundle.topology.write_pdb_snapshot(
+                                    &sel_frame.positions_angstrom,
+                                    &p,
+                                    &format!("MSM Selected M{} {}", macro_id, active_micro_label),
+                                    sel_frame.potential_energy_kcal,
+                                ) {
+                                    Ok(()) => {
+                                        self.status_note = Some(format!(
+                                            "Wrote 3D conformation to {}",
+                                            p.display()
+                                        ));
+                                    }
+                                    Err(e) => {
+                                        self.status_note = Some(format!("PDB save error: {}", e));
+                                    }
                                 }
                             }
                         }
@@ -556,7 +639,7 @@ impl MsmLandscapeTab {
                             ui,
                             &bundle.topology,
                             &sel_frame.positions_angstrom,
-                            &format!("M{} / S{}", macro_id, micro_id),
+                            &format!("M{} / {}", macro_id, active_micro_label),
                         );
                     });
 
@@ -660,31 +743,36 @@ fn draw_interactive_pmf_and_flux_canvas(
         StrokeKind::Inside,
     );
 
-    let pad_left = 58.0f32;
-    let pad_right = 68.0f32;
-    let pad_top = 42.0f32;
-    let pad_bottom = 48.0f32;
+    let pad_left = 64.0f32;
+    let pad_right = 76.0f32;
+    let pad_top = 58.0f32;
+    let pad_bottom = 52.0f32;
     let plot_rect = Rect::from_min_max(
         Pos2::new(rect.left() + pad_left, rect.top() + pad_top),
         Pos2::new(
-            (rect.right() - pad_right).max(rect.left() + pad_left + 80.0),
-            (rect.bottom() - pad_bottom).max(rect.top() + pad_top + 80.0),
+            (rect.right() - pad_right).max(rect.left() + pad_left + 120.0),
+            (rect.bottom() - pad_bottom).max(rect.top() + pad_top + 120.0),
         ),
     );
+    let circle_pad = (plot_rect.width().min(plot_rect.height()) * 0.10).clamp(22.0, 26.0);
+    let data_rect = plot_rect.shrink(circle_pad);
+
+    // Fill outer margin inside `plot_rect` with dark obsidian baseline so edge circles never clip
+    painter.rect_filled(plot_rect, CornerRadius::same(0), dark_pmf_colormap(1.0));
 
     let grid = &bundle.pmf_grid;
-    let cell_w = plot_rect.width() / (grid.nx.max(1) as f32);
-    let cell_h = plot_rect.height() / (grid.ny.max(1) as f32);
+    let cell_w = data_rect.width() / (grid.nx.max(1) as f32);
+    let cell_h = data_rect.height() / (grid.ny.max(1) as f32);
 
-    // 1. Render 2D Boltzmann Potential of Mean Force heatmap (`0 .. max_capped_kcal`)
+    // 1. Render 2D Boltzmann Potential of Mean Force heatmap (`0 .. max_capped_kcal`) inside `data_rect`
     for ix in 0..grid.nx {
         for iy in 0..grid.ny {
             let fe = grid.free_energy_kcal[ix][iy];
             let norm = (fe / grid.max_capped_kcal.max(0.1)).clamp(0.0, 1.0) as f32;
             let fill = dark_pmf_colormap(norm);
             let min_pt = Pos2::new(
-                plot_rect.left() + (ix as f32) * cell_w,
-                plot_rect.bottom() - ((iy + 1) as f32) * cell_h,
+                data_rect.left() + (ix as f32) * cell_w,
+                data_rect.bottom() - ((iy + 1) as f32) * cell_h,
             );
             let cell_rect =
                 Rect::from_min_size(min_pt, Vec2::new(cell_w + 0.6, cell_h + 0.6));
@@ -741,21 +829,25 @@ fn draw_interactive_pmf_and_flux_canvas(
         let fy = ((rg - grid.rg_min) / (grid.rg_max - grid.rg_min).max(1e-6))
             .clamp(0.0, 1.0) as f32;
         Pos2::new(
-            plot_rect.left() + fx * plot_rect.width(),
-            plot_rect.bottom() - fy * plot_rect.height(),
+            data_rect.left() + fx * data_rect.width(),
+            data_rect.bottom() - fy * data_rect.height(),
         )
     };
+
+    let plot_painter = painter.with_clip_rect(plot_rect);
 
     // 2. Equilibrium Markov Flux Network (`pi_i * T_ij` directed from lower -> higher committor `p_fold`)
     if show_flux {
         for i in 0..bundle.msm.num_microstates {
+            let orig_i = bundle.msm.active_microstates[i];
             for j in (i + 1)..bundle.msm.num_microstates {
                 let flux = bundle.msm.stationary_pi[i] * bundle.msm.transition_matrix[i][j];
                 if flux < min_flux {
                     continue;
                 }
-                let fi = &bundle.frames[bundle.clustering.medoid_frame_indices[i]];
-                let fj = &bundle.frames[bundle.clustering.medoid_frame_indices[j]];
+                let orig_j = bundle.msm.active_microstates[j];
+                let fi = &bundle.frames[bundle.clustering.medoid_frame_indices[orig_i]];
+                let fj = &bundle.frames[bundle.clustering.medoid_frame_indices[orig_j]];
                 let pi_scr = map_xy(fi.rmsd_to_lowest_energy_ang, fi.rg_angstrom);
                 let pj_scr = map_xy(fj.rmsd_to_lowest_energy_ang, fj.rg_angstrom);
 
@@ -768,7 +860,7 @@ fn draw_interactive_pmf_and_flux_canvas(
 
                 let width = (1.0 + 22.0 * (flux as f32)).clamp(1.0, 4.8);
                 let edge_col = Color32::from_rgba_unmultiplied(226, 232, 240, 130);
-                painter.line_segment([src, dst], Stroke::new(width, edge_col));
+                plot_painter.line_segment([src, dst], Stroke::new(width, edge_col));
 
                 // Midpoint directional chevron toward higher `p_fold`
                 let dir = dst - src;
@@ -779,8 +871,8 @@ fn draw_interactive_pmf_and_flux_canvas(
                     let mid = src + dir * 0.55;
                     let wing1 = mid - u * 6.5 + perp * 4.0;
                     let wing2 = mid - u * 6.5 - perp * 4.0;
-                    painter.line_segment([wing1, mid], Stroke::new(1.5_f32, edge_col));
-                    painter.line_segment([wing2, mid], Stroke::new(1.5_f32, edge_col));
+                    plot_painter.line_segment([wing1, mid], Stroke::new(1.5_f32, edge_col));
+                    plot_painter.line_segment([wing2, mid], Stroke::new(1.5_f32, edge_col));
                 }
             }
         }
@@ -797,7 +889,8 @@ fn draw_interactive_pmf_and_flux_canvas(
     let mut clicked_micro: Option<usize> = None;
 
     for i in 0..bundle.msm.num_microstates {
-        let med = &bundle.frames[bundle.clustering.medoid_frame_indices[i]];
+        let orig_i = bundle.msm.active_microstates[i];
+        let med = &bundle.frames[bundle.clustering.medoid_frame_indices[orig_i]];
         let center = map_xy(med.rmsd_to_lowest_energy_ang, med.rg_angstrom);
         let radius = (6.5 + 20.0 * (bundle.msm.stationary_pi[i].sqrt() as f32)).clamp(6.5, 18.0);
         let fill = committor_node_color(bundle.msm.folding_committor[i] as f32);
@@ -807,23 +900,27 @@ fn draw_interactive_pmf_and_flux_canvas(
         let is_exact_micro = selected_micro == Some(i);
 
         if in_selected_macro {
-            painter.circle_stroke(
+            plot_painter.circle_stroke(
                 center,
                 radius + 3.2,
                 Stroke::new(1.8_f32, Color32::from_rgb(56, 189, 248)),
             );
         }
         if is_exact_micro {
-            painter.circle_stroke(center, radius + 6.0, Stroke::new(2.2_f32, Color32::WHITE));
+            plot_painter.circle_stroke(
+                center,
+                radius + 6.0,
+                Stroke::new(2.2_f32, Color32::WHITE),
+            );
         }
 
-        painter.circle_filled(center, radius, fill);
-        painter.circle_stroke(
+        plot_painter.circle_filled(center, radius, fill);
+        plot_painter.circle_stroke(
             center,
             radius,
             Stroke::new(1.3_f32, Color32::from_rgb(10, 15, 24)),
         );
-        painter.text(
+        plot_painter.text(
             center,
             Align2::CENTER_CENTER,
             format!("S{}", i),
@@ -843,11 +940,19 @@ fn draw_interactive_pmf_and_flux_canvas(
         }
     }
 
-    // 4. Axis ticks & titles
+    // 4. Axis ticks & titles (aligned to `data_rect` projections)
     for t in 0..=4 {
         let f = (t as f32) / 4.0;
         let xv = grid.rmsd_min + (f as f64) * (grid.rmsd_max - grid.rmsd_min);
-        let xp = plot_rect.left() + f * plot_rect.width();
+        let xp = (data_rect.left() + f * data_rect.width())
+            .clamp(plot_rect.left() + 14.0, plot_rect.right() - 14.0);
+        painter.line_segment(
+            [
+                Pos2::new(xp, plot_rect.bottom()),
+                Pos2::new(xp, plot_rect.bottom() + 4.0),
+            ],
+            Stroke::new(1.0_f32, Color32::from_rgb(90, 108, 135)),
+        );
         painter.text(
             Pos2::new(xp, plot_rect.bottom() + 6.0),
             Align2::CENTER_TOP,
@@ -857,7 +962,15 @@ fn draw_interactive_pmf_and_flux_canvas(
         );
 
         let yv = grid.rg_min + (f as f64) * (grid.rg_max - grid.rg_min);
-        let yp = plot_rect.bottom() - f * plot_rect.height();
+        let yp = (data_rect.bottom() - f * data_rect.height())
+            .clamp(plot_rect.top() + 8.0, plot_rect.bottom() - 8.0);
+        painter.line_segment(
+            [
+                Pos2::new(plot_rect.left() - 4.0, yp),
+                Pos2::new(plot_rect.left(), yp),
+            ],
+            Stroke::new(1.0_f32, Color32::from_rgb(90, 108, 135)),
+        );
         painter.text(
             Pos2::new(plot_rect.left() - 6.0, yp),
             Align2::RIGHT_CENTER,
@@ -868,7 +981,7 @@ fn draw_interactive_pmf_and_flux_canvas(
     }
 
     painter.text(
-        Pos2::new(rect.left() + 14.0, rect.top() + 10.0),
+        Pos2::new(rect.left() + 14.0, rect.top() + 8.0),
         Align2::LEFT_TOP,
         format!(
             "2D Free-Energy Surface W(RMSD, Rg) & Markov Flux — {} ({})",
@@ -885,26 +998,32 @@ fn draw_interactive_pmf_and_flux_canvas(
         Color32::from_rgb(148, 163, 184),
     );
     painter.text(
-        Pos2::new(rect.left() + 8.0, plot_rect.top() - 16.0),
+        Pos2::new(plot_rect.left(), plot_rect.top() - 16.0),
         Align2::LEFT_TOP,
         "Rg (A)",
         FontId::monospace(10.5),
         Color32::from_rgb(148, 163, 184),
     );
 
-    // 5. Hover readout bar (microstate details or interpolated 2D PMF cell value)
+    // 5. Hover readout bar (positioned above `Rg (A)` with zero overlap)
     if let Some(m_idx) = hovered_micro {
-        let med = &bundle.frames[bundle.clustering.medoid_frame_indices[m_idx]];
+        let orig_m = bundle.msm.active_microstates[m_idx];
+        let med = &bundle.frames[bundle.clustering.medoid_frame_indices[orig_m]];
         let mac_id = bundle.msm.microstate_to_macrostate[m_idx];
+        let micro_dg = if bundle.msm.microstate_free_energy_kcal[m_idx].abs() < 5e-4 {
+            0.0
+        } else {
+            bundle.msm.microstate_free_energy_kcal[m_idx]
+        };
         painter.text(
-            Pos2::new(rect.left() + 14.0, rect.top() + 26.0),
+            Pos2::new(rect.left() + 14.0, rect.top() + 24.0),
             Align2::LEFT_TOP,
             format!(
                 "Hover S{} (Macrostate M{}): pi={:.2}% | dG={:.2} kcal/mol | p_fold={:.2} | Medoid={} — Click to load 3D",
                 m_idx,
                 mac_id,
                 bundle.msm.stationary_pi[m_idx] * 100.0,
-                bundle.msm.microstate_free_energy_kcal[m_idx],
+                micro_dg,
                 bundle.msm.folding_committor[m_idx],
                 med.wu_id
             ),
@@ -913,16 +1032,16 @@ fn draw_interactive_pmf_and_flux_canvas(
         );
     } else if let Some(hp) = hover_pos {
         if plot_rect.contains(hp) {
-            let fx = ((hp.x - plot_rect.left()) / plot_rect.width().max(1.0)).clamp(0.0, 0.9999);
+            let fx = ((hp.x - data_rect.left()) / data_rect.width().max(1.0)).clamp(0.0, 0.9999);
             let fy =
-                ((plot_rect.bottom() - hp.y) / plot_rect.height().max(1.0)).clamp(0.0, 0.9999);
+                ((data_rect.bottom() - hp.y) / data_rect.height().max(1.0)).clamp(0.0, 0.9999);
             let ix = ((fx * (grid.nx as f32)) as usize).min(grid.nx.saturating_sub(1));
             let iy = ((fy * (grid.ny as f32)) as usize).min(grid.ny.saturating_sub(1));
             let rmsd_v = grid.rmsd_min + (fx as f64) * (grid.rmsd_max - grid.rmsd_min);
             let rg_v = grid.rg_min + (fy as f64) * (grid.rg_max - grid.rg_min);
             let pmf_v = grid.free_energy_kcal[ix][iy];
             painter.text(
-                Pos2::new(rect.left() + 14.0, rect.top() + 26.0),
+                Pos2::new(rect.left() + 14.0, rect.top() + 24.0),
                 Align2::LEFT_TOP,
                 format!(
                     "Surface Cursor: RMSD = {:.2} A | Rg = {:.2} A | PMF = {:.2} kcal/mol",
@@ -978,15 +1097,40 @@ fn committor_node_color(p_fold: f32) -> Color32 {
     }
 }
 
+fn filter_cold_rung_frames(
+    all_frames: Vec<ConformationalFrame>,
+    ref_temp: f64,
+    cold_only: bool,
+) -> Vec<ConformationalFrame> {
+    if !cold_only {
+        return all_frames;
+    }
+    let cutoff = ref_temp + 25.0;
+    let cold: Vec<ConformationalFrame> = all_frames
+        .iter()
+        .filter(|f| f.temperature_kelvin <= cutoff)
+        .cloned()
+        .collect();
+    if cold.len() >= 8 {
+        cold
+    } else {
+        all_frames
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_msm_from_live_frames(
     topology: Arc<ProteinTopology>,
-    mut frames: Vec<ConformationalFrame>,
+    raw_frames: Vec<ConformationalFrame>,
     steps_per_gen: u64,
     k_req: usize,
     m_req: usize,
     lag: u32,
     ref_temp: f64,
+    cold_only: bool,
 ) -> Result<ComputedMsmBundle, String> {
+    let total_raw = raw_frames.len();
+    let mut frames = filter_cold_rung_frames(raw_frames, ref_temp, cold_only);
     frames.sort_by_key(|f| (f.wu_id.run, f.wu_id.clone, f.chain_step));
     for (idx, f) in frames.iter_mut().enumerate() {
         f.frame_idx = idx;
@@ -1037,7 +1181,11 @@ fn build_msm_from_live_frames(
     };
 
     Ok(ComputedMsmBundle {
-        source_label: format!("Live MREMD Studio ({} frames)", frames.len()),
+        source_label: if cold_only && frames.len() < total_raw {
+            format!("Live Cold-Rung ({}/{total_raw} frames)", frames.len())
+        } else {
+            format!("Live MREMD Studio ({} frames)", frames.len())
+        },
         manifest,
         topology,
         frames,
@@ -1054,10 +1202,18 @@ fn build_msm_from_redb_vault(
     m_req: usize,
     lag: u32,
     ref_temp: f64,
+    cold_only: bool,
 ) -> Result<ComputedMsmBundle, String> {
     let store = FoldStore::open(vault_dir).map_err(|e| e.to_string())?;
-    let (manifest, topo, frames) =
-        extract_project_frames(&store, project_id, None).map_err(|e| e.to_string())?;
+    let max_t = if cold_only {
+        Some(ref_temp + 25.0)
+    } else {
+        None
+    };
+    let (manifest, topo, frames) = match extract_project_frames(&store, project_id, max_t) {
+        Ok(res) if res.2.len() >= 8 => res,
+        _ => extract_project_frames(&store, project_id, None).map_err(|e| e.to_string())?,
+    };
     let topo_arc = Arc::new(topo);
 
     let rmsd_mat = compute_pairwise_rmsd_matrix(&topo_arc, &frames);

@@ -14,15 +14,18 @@
 // along with this program.  If not, see <https://gnu.org>.
 
 use crate::lan_client::{
-    spawn_network_telemetry_thread, NetworkTelemetryState, PollerTargets,
+    spawn_network_telemetry_thread, spawn_one_click_mdns_scan, NetworkTelemetryState,
+    PollerTargets,
 };
 use crate::live_sandbox::{
-    spawn_live_folding_worker, LiveFoldingState, SandboxCommand, TargetPreset,
+    spawn_live_folding_worker, LiveFoldingState, NativeReferenceSource, SandboxCommand,
+    TargetPreset,
 };
 use crate::msm_tab::MsmLandscapeTab;
 use crate::plots::draw_scientific_trace;
 use crate::viewport3d::{ConformationViewport, RenderRepresentation};
 use egui::{Color32, RichText};
+use fold_physics::{sanitize_amino_acid_sequence, ProteinTopology};
 use fold_proto::{
     ClusterStateSnapshot, ComputeTier, GlobalFederationTelemetry, LivePeerStatus,
     NodeCapabilityProfile, PeerEndpoint, RegisteredClusterRecord, WorkUnitId,
@@ -64,6 +67,9 @@ pub struct BeoFoldGuiApp {
     selected_preset: TargetPreset,
     steps_per_slice: u64,
     use_gpu: bool,
+    custom_seq_name: String,
+    custom_seq_input: String,
+    last_import_msg: Option<String>,
 
     // Shared worker channels & telemetry snapshots
     net_state: Arc<Mutex<NetworkTelemetryState>>,
@@ -74,6 +80,7 @@ pub struct BeoFoldGuiApp {
     compare_start_vs_folded: bool,
     msm_tab: MsmLandscapeTab,
     last_export_msg: Option<String>,
+    show_about: bool,
 }
 
 impl BeoFoldGuiApp {
@@ -122,6 +129,9 @@ impl BeoFoldGuiApp {
             selected_preset: preset,
             steps_per_slice: 150,
             use_gpu: cfg.use_gpu,
+            custom_seq_name: "CustomPeptide".to_string(),
+            custom_seq_input: "NLYIQWLKDGGPSSGRPPPS".to_string(),
+            last_import_msg: None,
             net_state,
             net_targets_tx,
             live_state,
@@ -130,6 +140,7 @@ impl BeoFoldGuiApp {
             compare_start_vs_folded: false,
             msm_tab: MsmLandscapeTab::default(),
             last_export_msg: None,
+            show_about: false,
         }
     }
 
@@ -150,7 +161,7 @@ impl BeoFoldGuiApp {
     fn render_top_bar(&mut self, ui: &mut egui::Ui, net: &NetworkTelemetryState) {
         ui.horizontal(|ui| {
             ui.label(
-                RichText::new("BEOFOLD v1.3")
+                RichText::new(concat!("BEOFOLD v", env!("CARGO_PKG_VERSION")))
                     .strong()
                     .size(16.0)
                     .color(Color32::from_rgb(56, 189, 248)),
@@ -228,7 +239,62 @@ impl BeoFoldGuiApp {
             if ui.button("Connect / Refresh").clicked() {
                 self.apply_network_targets();
             }
+            let scan_label = if net.lan_discovery_scanning {
+                "Scanning LAN..."
+            } else {
+                "Discover LAN"
+            };
+            if ui
+                .add_enabled(!net.lan_discovery_scanning, egui::Button::new(scan_label))
+                .on_hover_text(
+                    "Browse _beofold._udp.local. (mDNS) and localhost 7443..7446 for Beowulf cluster nodes.",
+                )
+                .clicked()
+            {
+                spawn_one_click_mdns_scan(
+                    self.cluster_secret_input.clone(),
+                    self.wan_sync_url_input.clone(),
+                    self.net_state.clone(),
+                    self.net_targets_tx.clone(),
+                    true,
+                );
+            }
         });
+
+        if !net.discovered_lan_peers.is_empty() || net.lan_discovery_status.is_some() {
+            ui.horizontal_wrapped(|ui| {
+                if let Some(ref st) = net.lan_discovery_status {
+                    ui.label(
+                        RichText::new(st)
+                            .monospace()
+                            .size(10.5)
+                            .color(Color32::from_rgb(148, 163, 184)),
+                    );
+                }
+                let mut picked_peer: Option<String> = None;
+                for peer in &net.discovered_lan_peers {
+                    let chip_col = if peer.matches_secret {
+                        Color32::from_rgb(52, 211, 153)
+                    } else {
+                        Color32::from_rgb(251, 191, 36)
+                    };
+                    let chip_text = format!(
+                        "{} [Tier {} | {}c]",
+                        peer.addr, peer.tier, peer.cores
+                    );
+                    if ui
+                        .small_button(RichText::new(chip_text).monospace().color(chip_col))
+                        .clicked()
+                    {
+                        picked_peer = Some(peer.addr.to_string());
+                    }
+                }
+                if let Some(addr_str) = picked_peer {
+                    self.lan_peer_input = addr_str;
+                    self.apply_network_targets();
+                }
+            });
+        }
     }
 
     fn render_studio_tab(&mut self, ctx: &egui::Context, live: &LiveFoldingState) {
@@ -275,6 +341,7 @@ impl BeoFoldGuiApp {
                                     .selectable_value(&mut self.selected_preset, p, p.label())
                                     .changed()
                                 {
+                                    self.last_import_msg = None;
                                     let _ = self.sandbox_tx.send(SandboxCommand::ResetTarget {
                                         preset: self.selected_preset,
                                         use_gpu: self.use_gpu,
@@ -283,6 +350,99 @@ impl BeoFoldGuiApp {
                                 }
                             }
                         });
+
+                    ui.horizontal(|ui| {
+                        if ui.button("Import .pdb / .cif...").clicked() {
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("Protein Structure", &["pdb", "ent", "cif", "mmcif"])
+                                .pick_file()
+                            {
+                                match ProteinTopology::from_pdb_file(&path) {
+                                    Ok((topo, coords)) => {
+                                        let disp = format!(
+                                            "{} ({} aa, PDB)",
+                                            topo.name, topo.residue_count
+                                        );
+                                        self.last_import_msg =
+                                            Some(format!("Loaded PDB: {}", path.display()));
+                                        let _ = self.sandbox_tx.send(
+                                            SandboxCommand::LoadCustomTarget {
+                                                name: disp,
+                                                topology: topo,
+                                                positions: coords,
+                                                from_pdb: true,
+                                                use_gpu: self.use_gpu,
+                                                steps_per_slice: self.steps_per_slice,
+                                            },
+                                        );
+                                    }
+                                    Err(err) => {
+                                        self.last_import_msg =
+                                            Some(format!("PDB import error: {err}"));
+                                    }
+                                }
+                            }
+                        }
+                    });
+
+                    ui.collapsing("Custom Sequence (FASTA / 1-Letter)", |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Name:").size(11.0));
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.custom_seq_name)
+                                    .desired_width(175.0),
+                            );
+                        });
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.custom_seq_input)
+                                .desired_rows(2)
+                                .desired_width(290.0),
+                        );
+                        if ui.button("Build & Load Sequence").clicked() {
+                            match sanitize_amino_acid_sequence(&self.custom_seq_input) {
+                                Ok(clean_seq) => {
+                                    let name = if self.custom_seq_name.trim().is_empty() {
+                                        "CustomPeptide"
+                                    } else {
+                                        self.custom_seq_name.trim()
+                                    };
+                                    let (topo, coords) = ProteinTopology::build_polypeptide_from_sequence(
+                                        name,
+                                        &clean_seq,
+                                    );
+                                    let disp = format!(
+                                        "{} ({} aa, Seq)",
+                                        topo.name, topo.residue_count
+                                    );
+                                    self.last_import_msg = Some(format!(
+                                        "Built {} ({} residues)",
+                                        topo.name, topo.residue_count
+                                    ));
+                                    let _ =
+                                        self.sandbox_tx.send(SandboxCommand::LoadCustomTarget {
+                                            name: disp,
+                                            topology: topo,
+                                            positions: coords,
+                                            from_pdb: false,
+                                            use_gpu: self.use_gpu,
+                                            steps_per_slice: self.steps_per_slice,
+                                        });
+                                }
+                                Err(err) => {
+                                    self.last_import_msg =
+                                        Some(format!("Sequence error: {err}"));
+                                }
+                            }
+                        }
+                    });
+                    if let Some(ref msg) = self.last_import_msg {
+                        ui.label(
+                            RichText::new(msg)
+                                .monospace()
+                                .size(10.5)
+                                .color(Color32::from_rgb(56, 189, 248)),
+                        );
+                    }
 
                     if ui
                         .checkbox(&mut self.use_gpu, "Enable wgpu WGSL Compute Shaders")
@@ -342,9 +502,33 @@ impl BeoFoldGuiApp {
                     ui.horizontal(|ui| {
                         ui.add(
                             egui::TextEdit::singleline(&mut self.export_pdb_path)
-                                .desired_width(185.0),
+                                .desired_width(140.0),
                         );
-                        if ui.button("Export .pdb").clicked() {
+                        if ui.button("Save .pdb...").clicked() {
+                            let default_name = PathBuf::from(self.export_pdb_path.trim())
+                                .file_name()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("beofold_supervisor_best.pdb")
+                                .to_string();
+                            if let Some(out) = rfd::FileDialog::new()
+                                .add_filter("PDB Structure", &["pdb"])
+                                .set_file_name(&default_name)
+                                .save_file()
+                            {
+                                self.export_pdb_path = out.display().to_string();
+                                match live.export_best_pdb(&out) {
+                                    Ok(()) => {
+                                        self.last_export_msg =
+                                            Some(format!("Saved PDB to {}", out.display()));
+                                    }
+                                    Err(e) => {
+                                        self.last_export_msg =
+                                            Some(format!("Export failed: {}", e));
+                                    }
+                                }
+                            }
+                        }
+                        if ui.button("Export").clicked() {
                             let out = PathBuf::from(self.export_pdb_path.trim());
                             match live.export_best_pdb(&out) {
                                 Ok(()) => {
@@ -370,9 +554,14 @@ impl BeoFoldGuiApp {
                     ui.horizontal(|ui| {
                         ui.add(
                             egui::TextEdit::singleline(&mut self.vault_dir_input)
-                                .desired_width(175.0),
+                                .desired_width(120.0),
                         );
-                        if ui.button("Load redb Vault").clicked() {
+                        if ui.button("Browse...").clicked() {
+                            if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                                self.vault_dir_input = folder.display().to_string();
+                            }
+                        }
+                        if ui.button("Load Vault").clicked() {
                             let _ = self.sandbox_tx.send(SandboxCommand::LoadFromVault {
                                 data_dir: PathBuf::from(self.vault_dir_input.trim()),
                                 project_id: 1,
@@ -449,37 +638,55 @@ impl BeoFoldGuiApp {
             .resizable(true)
             .default_width(350.0)
             .show(ctx, |ui| {
-                ui.heading("Thermodynamic & MSM Traces");
-                ui.add_space(4.0);
-                draw_scientific_trace(
-                    ui,
-                    "Potential Energy V_total (green = min)",
-                    "kcal/mol",
-                    &live.potential_history,
-                    Some(&live.min_potential_history),
-                    Color32::from_rgb(56, 189, 248),
-                    155.0,
-                );
-                ui.add_space(8.0);
-                draw_scientific_trace(
-                    ui,
-                    "Radius of Gyration R_g",
-                    "A",
-                    &live.rg_history,
-                    None,
-                    Color32::from_rgb(245, 190, 65),
-                    140.0,
-                );
-                ui.add_space(8.0);
-                draw_scientific_trace(
-                    ui,
-                    "C-Alpha RMSD from Unfolded Seed",
-                    "A",
-                    &live.rmsd_history,
-                    None,
-                    Color32::from_rgb(192, 132, 252),
-                    140.0,
-                );
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.heading("Thermodynamic & MSM Traces");
+                    ui.add_space(4.0);
+                    draw_scientific_trace(
+                        ui,
+                        "Potential Energy V_total (green = min)",
+                        "kcal/mol",
+                        &live.potential_history,
+                        Some(&live.min_potential_history),
+                        Color32::from_rgb(56, 189, 248),
+                        145.0,
+                    );
+                    ui.add_space(6.0);
+                    draw_scientific_trace(
+                        ui,
+                        "Radius of Gyration R_g",
+                        "A",
+                        &live.rg_history,
+                        None,
+                        Color32::from_rgb(245, 190, 65),
+                        130.0,
+                    );
+                    ui.add_space(6.0);
+                    draw_scientific_trace(
+                        ui,
+                        "C-Alpha RMSD from Unfolded Seed",
+                        "A",
+                        &live.rmsd_history,
+                        None,
+                        Color32::from_rgb(192, 132, 252),
+                        130.0,
+                    );
+                    ui.add_space(6.0);
+                    let q_title = match live.native_source {
+                        NativeReferenceSource::PdbCrystal => "Native Contacts Q(t) [PDB Ref]",
+                        NativeReferenceSource::LowestEnergyFold => {
+                            "Native Contacts Q(t) [Low-E Ref]"
+                        }
+                    };
+                    draw_scientific_trace(
+                        ui,
+                        q_title,
+                        "Q",
+                        &live.q_history,
+                        None,
+                        Color32::from_rgb(52, 211, 153),
+                        130.0,
+                    );
+                });
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -521,6 +728,14 @@ impl BeoFoldGuiApp {
                         format!(
                             "FOLDED (Low-E {}) | Rg={:.2} A | V={:.1}",
                             live.best_wu, live.best_rg_angstrom, live.best_potential_kcal
+                        ),
+                    )
+                } else if let Some(ref lbl) = live.inspected_label {
+                    (
+                        &live.current_positions,
+                        format!(
+                            "MSM {} | V={:.1} kcal/mol",
+                            lbl, live.current_potential_kcal
                         ),
                     )
                 } else if let Some(r) = cold_rung {
@@ -572,10 +787,15 @@ impl BeoFoldGuiApp {
                         "Lowest-Energy Conformation {} ({:.2} kcal/mol)",
                         live.best_wu, live.best_potential_kcal
                     )
+                } else if let Some(ref lbl) = live.inspected_label {
+                    format!(
+                        "MSM {} — {} ({:.2} kcal/mol)",
+                        lbl, live.current_wu, live.current_potential_kcal
+                    )
                 } else {
                     format!(
                         "Active Conformation {} ({:.2} kcal/mol)",
-                        live.best_wu, live.best_potential_kcal
+                        live.current_wu, live.current_potential_kcal
                     )
                 };
                 self.viewport.ui(ui, &live.topology, coords, &mode_str);
@@ -597,8 +817,21 @@ impl BeoFoldGuiApp {
             let Some(ref snap) = net.lan_snapshot else {
                 ui.add_space(12.0);
                 ui.label(
-                    "No active LAN Beowulf node connected yet. Launch `fold-node mesh --init-trpcage` on your machines and click 'Connect / Refresh' above.",
+                    "No active LAN Beowulf node connected yet. Launch `fold-node mesh --init-trpcage` on your machines and click 'Discover LAN' or 'Connect / Refresh' above.",
                 );
+                ui.add_space(6.0);
+                if ui
+                    .add_enabled(!net.lan_discovery_scanning, egui::Button::new("Discover LAN Peers Now"))
+                    .clicked()
+                {
+                    spawn_one_click_mdns_scan(
+                        self.cluster_secret_input.clone(),
+                        self.wan_sync_url_input.clone(),
+                        self.net_state.clone(),
+                        self.net_targets_tx.clone(),
+                        true,
+                    );
+                }
                 return;
             };
 
@@ -1061,14 +1294,50 @@ impl BeoFoldGuiApp {
 
         egui::TopBottomPanel::bottom("beofold_status_footer").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(&live_snap.status_banner)
-                        .monospace()
-                        .size(11.5)
-                        .color(Color32::from_rgb(180, 194, 212)),
-                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("About").clicked() {
+                        self.show_about = true;
+                    }
+                    ui.separator();
+                    ui.label(
+                        RichText::new("Copyright CRV Science Network")
+                            .monospace()
+                            .size(11.0)
+                            .color(Color32::from_rgb(148, 163, 184)),
+                    );
+                    ui.separator();
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(&live_snap.status_banner)
+                                    .monospace()
+                                    .size(11.5)
+                                    .color(Color32::from_rgb(180, 194, 212)),
+                            )
+                            .truncate(),
+                        );
+                    });
+                });
             });
         });
+
+        if self.show_about {
+            egui::Window::new("About BeoFold")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .open(&mut self.show_about)
+                .show(ctx, |ui| {
+                    ui.heading(concat!("BeoFold v", env!("CARGO_PKG_VERSION")));
+                    ui.label("Distributed Protein Folding & Markov State Model Supervisor");
+                    ui.add_space(6.0);
+                    ui.label("Copyright (C) 2026 CRV Science Network");
+                    ui.label("License: GNU General Public License v3.0 or later (GPL-3.0-or-later)");
+                    ui.add_space(6.0);
+                    ui.hyperlink_to("CRV Science Network (https://crvscience.com)", "https://crvscience.com");
+                    ui.hyperlink_to("CRV Science Apps Hub (https://crvscience.com/apps)", "https://crvscience.com/apps");
+                });
+        }
 
         match self.active_tab {
             WorkspaceTab::FoldingStudio3D => self.render_studio_tab(ctx, &live_snap),

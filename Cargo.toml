@@ -27,12 +27,14 @@ getrandom = "0.2"
 lz4_flex = "0.11"
 mdns-sd = "0.21"
 pdbtbx = "0.12"
+png = "0.18"
 pollster = "0.4"
 quinn = "0.11"
 rayon = "1.10"
 rcgen = "0.14"
 redb = "2.6"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+rfd = "0.15"
 rkyv = { version = "0.8", features = ["bytecheck"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 sysinfo = "0.33"
@@ -51,4 +53,4 @@ fold-msm = { path = "crates/fold-msm" }
 opt-level = 3
 lto = "thin"
 codegen-units = 1
-strip = false
+strip = "symbols"

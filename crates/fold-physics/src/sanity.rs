@@ -342,6 +342,70 @@ fn max_symmetric_4x4_eigenvalue(mut a: [[f64; 4]; 4]) -> f64 {
     a[0][0].max(a[1][1]).max(a[2][2]).max(a[3][3])
 }
 
+/// Returns `(atom_i, atom_j)` C-alpha native contact pairs separated by `|res_j - res_i| >= 2`
+/// (or on distinct chains) with C-alpha Euclidean distance `<= cutoff_ang`.
+pub fn native_ca_contact_pairs(
+    topology: &ProteinTopology,
+    native_positions: &[[f32; 3]],
+    cutoff_ang: f64,
+) -> Vec<(usize, usize)> {
+    if native_positions.len() != topology.atoms.len() {
+        return Vec::new();
+    }
+    let cas: Vec<(usize, i32, char)> = topology
+        .atoms
+        .iter()
+        .enumerate()
+        .filter(|(_, atom)| atom.is_ca)
+        .map(|(idx, atom)| (idx, atom.res_seq, atom.chain_id))
+        .collect();
+    let mut pairs = Vec::new();
+    for i in 0..cas.len() {
+        for j in (i + 1)..cas.len() {
+            let (idx_i, res_i, ch_i) = cas[i];
+            let (idx_j, res_j, ch_j) = cas[j];
+            if ch_i == ch_j && (res_j - res_i).abs() < 2 {
+                continue;
+            }
+            let p1 = native_positions[idx_i];
+            let p2 = native_positions[idx_j];
+            let dx = (p1[0] - p2[0]) as f64;
+            let dy = (p1[1] - p2[1]) as f64;
+            let dz = (p1[2] - p2[2]) as f64;
+            if (dx * dx + dy * dy + dz * dz).sqrt() <= cutoff_ang {
+                pairs.push((idx_i, idx_j));
+            }
+        }
+    }
+    pairs
+}
+
+/// Computes the fraction `Q in [0.0, 1.0]` of native C-alpha contacts preserved within `cutoff_ang`.
+pub fn fraction_native_contacts(
+    native_pairs: &[(usize, usize)],
+    positions: &[[f32; 3]],
+    cutoff_ang: f64,
+) -> f64 {
+    if native_pairs.is_empty() {
+        return 1.0;
+    }
+    let formed = native_pairs
+        .iter()
+        .filter(|&&(i, j)| {
+            if i >= positions.len() || j >= positions.len() {
+                return false;
+            }
+            let p1 = positions[i];
+            let p2 = positions[j];
+            let dx = (p1[0] - p2[0]) as f64;
+            let dy = (p1[1] - p2[1]) as f64;
+            let dz = (p1[2] - p2[2]) as f64;
+            (dx * dx + dy * dy + dz * dz).sqrt() <= cutoff_ang
+        })
+        .count();
+    (formed as f64) / (native_pairs.len() as f64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,5 +420,28 @@ mod tests {
             .collect();
         let rmsd = compute_ca_rmsd(&topo, &coords_a, &coords_b);
         assert!(rmsd < 1e-4, "expected ~0 RMSD under rigid motion, got {}", rmsd);
+    }
+
+    #[test]
+    fn native_contacts_q_equals_one_for_native_and_drops_when_stretched() {
+        let (topo, coords) = ProteinTopology::build_trp_cage_seed();
+        let pairs = native_ca_contact_pairs(&topo, &coords, 8.5);
+        assert!(
+            !pairs.is_empty(),
+            "Trp-cage seed must have >=1 C-alpha contact within 8.5 A"
+        );
+        let q_self = fraction_native_contacts(&pairs, &coords, 8.8);
+        assert!((q_self - 1.0).abs() < 1e-12);
+
+        let stretched: Vec<[f32; 3]> = coords
+            .iter()
+            .enumerate()
+            .map(|(i, p)| [p[0] + (i as f32) * 3.0, p[1], p[2]])
+            .collect();
+        let q_stretched = fraction_native_contacts(&pairs, &stretched, 8.8);
+        assert!(
+            q_stretched < 0.5,
+            "stretched chain should lose native contacts, got Q={q_stretched}"
+        );
     }
 }

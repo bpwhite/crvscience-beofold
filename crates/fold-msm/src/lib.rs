@@ -25,6 +25,6 @@ pub use clustering::{
 };
 pub use landscape::{compute_2d_pmf_grid, export_msm_bundle, ExportedMsmArtifacts, PmfGrid2D};
 pub use transition::{
-    cyclic_jacobi_symmetric_eigen, estimate_reversible_msm, MetastableMacrostate,
-    ReversibleMsmModel,
+    cyclic_jacobi_symmetric_eigen, estimate_reversible_msm, estimate_reversible_msm_with_max_temp,
+    MetastableMacrostate, ReversibleMsmModel,
 };

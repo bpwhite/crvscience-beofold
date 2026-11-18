@@ -19,9 +19,10 @@ use fold_msm::{
     PmfGrid2D, ReversibleMsmModel,
 };
 use fold_physics::{
-    compute_radius_of_gyration, initialize_clone_checkpoint, metropolis_swap_probability,
-    minimize_steric_clashes, run_generation_chunk, try_mremd_swap, verify_checkpoint_sanity,
-    ChaCha8Rng, LangevinConfig, ProteinTopology, SanityThresholds, K_BOLTZMANN_KCAL,
+    compute_radius_of_gyration, fraction_native_contacts, initialize_clone_checkpoint,
+    metropolis_swap_probability, minimize_steric_clashes, native_ca_contact_pairs,
+    run_generation_chunk, try_mremd_swap, verify_checkpoint_sanity, ChaCha8Rng, LangevinConfig,
+    ProteinTopology, SanityThresholds, K_BOLTZMANN_KCAL,
 };
 use fold_proto::{
     MremdEndpoint, NodeIdentity, ProjectManifest, SignedWorkUnitResult, TrajectoryCheckpoint,
@@ -202,65 +203,6 @@ fn json_escape(s: &str) -> String {
         }
     }
     out
-}
-
-fn ca_indices_with_res_seq(topology: &ProteinTopology) -> Vec<(usize, i32)> {
-    topology
-        .atoms
-        .iter()
-        .enumerate()
-        .filter(|(_, atom)| atom.is_ca)
-        .map(|(idx, atom)| (idx, atom.res_seq))
-        .collect()
-}
-
-fn native_ca_contact_pairs(
-    topology: &ProteinTopology,
-    native_positions: &[[f32; 3]],
-    cutoff_ang: f64,
-) -> Vec<(usize, usize)> {
-    let cas = ca_indices_with_res_seq(topology);
-    let mut pairs = Vec::new();
-    for i in 0..cas.len() {
-        for j in (i + 1)..cas.len() {
-            let (idx_i, res_i) = cas[i];
-            let (idx_j, res_j) = cas[j];
-            if (res_j - res_i).abs() < 2 {
-                continue;
-            }
-            let p1 = native_positions[idx_i];
-            let p2 = native_positions[idx_j];
-            let dx = (p1[0] - p2[0]) as f64;
-            let dy = (p1[1] - p2[1]) as f64;
-            let dz = (p1[2] - p2[2]) as f64;
-            if (dx * dx + dy * dy + dz * dz).sqrt() <= cutoff_ang {
-                pairs.push((idx_i, idx_j));
-            }
-        }
-    }
-    pairs
-}
-
-fn fraction_native_contacts(
-    native_pairs: &[(usize, usize)],
-    positions: &[[f32; 3]],
-    cutoff_ang: f64,
-) -> f64 {
-    if native_pairs.is_empty() {
-        return 1.0;
-    }
-    let formed = native_pairs
-        .iter()
-        .filter(|&&(i, j)| {
-            let p1 = positions[i];
-            let p2 = positions[j];
-            let dx = (p1[0] - p2[0]) as f64;
-            let dy = (p1[1] - p2[1]) as f64;
-            let dz = (p1[2] - p2[2]) as f64;
-            (dx * dx + dy * dy + dz * dz).sqrt() <= cutoff_ang
-        })
-        .count();
-    (formed as f64) / (native_pairs.len() as f64)
 }
 
 #[allow(dead_code)]
@@ -509,6 +451,16 @@ fn build_or_get_mremd_ensemble() -> &'static MremdEnsembleTelemetry {
         );
         for (idx, f) in frames.iter().enumerate() {
             let ms = clustering.frame_assignments[idx];
+            let (act_ms, pi_val, fe_val, comm_val) =
+                match msm.orig_to_active.get(ms).copied().flatten() {
+                    Some(act) => (
+                        act,
+                        msm.stationary_pi[act],
+                        msm.microstate_free_energy_kcal[act],
+                        msm.folding_committor[act],
+                    ),
+                    None => (ms, 0.0, 6.0, 0.0),
+                };
             let _ = writeln!(
                 csv,
                 "{},{},{},{},{:.2},{:.4},{:.4},{:.2},{:.4},{:.4},{:.4},{},{:.6},{:.4},{:.6}",
@@ -523,10 +475,10 @@ fn build_or_get_mremd_ensemble() -> &'static MremdEnsembleTelemetry {
                 f.rmsd_to_seed_ang,
                 f.rmsd_to_lowest_energy_ang,
                 frame_q_scores[idx],
-                ms,
-                msm.stationary_pi[ms],
-                msm.microstate_free_energy_kcal[ms],
-                msm.folding_committor[ms],
+                act_ms,
+                pi_val,
+                fe_val,
+                comm_val,
             );
         }
         let csv_path = validation_dir().join("mremd_msm_landscape.csv");

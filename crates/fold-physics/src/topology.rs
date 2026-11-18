@@ -18,7 +18,7 @@ use pdbtbx::Element;
 use rkyv::rancor::Error as RkyvError;
 use rkyv::util::AlignedVec;
 use rkyv::{Archive, Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -257,8 +257,9 @@ impl ProteinTopology {
 
         // Gentle open coil pitch so starting state is unfolded (`R_g` large) and sterically valid
         for (res_idx, aa) in sequence.chars().enumerate() {
+            let aa_up = aa.to_ascii_uppercase();
             let res_seq = (res_idx + 1) as i32;
-            let res_name = one_to_three_letter(aa);
+            let res_name = one_to_three_letter(aa_up);
             let s = res_idx as f32;
 
             // Place backbone along a wide, gently curving open polypeptide chain (~3.80 A CA-CA step)
@@ -393,8 +394,8 @@ impl ProteinTopology {
             }
 
             // Sidechain C-beta / united sidechain bead for all non-glycine residues
-            if aa != 'G' {
-                let (sc_mass, sc_charge, sc_sigma, sc_eps) = sidechain_bead_params(aa);
+            if aa_up != 'G' {
+                let (sc_mass, sc_charge, sc_sigma, sc_eps) = sidechain_bead_params(aa_up);
                 let cb_pos = [
                     ca_pos[0] + 1.54 * radial[0],
                     ca_pos[1] + 1.54 * radial[1],
@@ -430,7 +431,7 @@ impl ProteinTopology {
 
         let topo = Self::build_angles_torsions_exclusions(
             name.to_string(),
-            sequence.to_string(),
+            sequence.to_ascii_uppercase(),
             sequence.chars().count() as u32,
             atoms,
             bonds,
@@ -492,7 +493,7 @@ impl ProteinTopology {
         bonds: Vec<BondTerm>,
         positions: &[[f32; 3]],
     ) -> Self {
-        let mut adj: HashMap<u32, Vec<u32>> = HashMap::new();
+        let mut adj: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
         let mut excl_set: HashSet<u64> = HashSet::new();
 
         for b in &bonds {
@@ -708,6 +709,59 @@ fn three_to_one_letter(res: &str) -> char {
     }
 }
 
+/// Sanitizes a raw 1-letter amino acid or FASTA string by stripping `>` header lines and
+/// whitespace, uppercasing, and validating that every residue is one of the 20 standard amino acids.
+pub fn sanitize_amino_acid_sequence(raw: &str) -> Result<String, PhysicsError> {
+    let mut seq = String::new();
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('>') {
+            continue;
+        }
+        for ch in trimmed.chars() {
+            if ch.is_ascii_whitespace() {
+                continue;
+            }
+            let up = ch.to_ascii_uppercase();
+            if matches!(
+                up,
+                'A' | 'C'
+                    | 'D'
+                    | 'E'
+                    | 'F'
+                    | 'G'
+                    | 'H'
+                    | 'I'
+                    | 'K'
+                    | 'L'
+                    | 'M'
+                    | 'N'
+                    | 'P'
+                    | 'Q'
+                    | 'R'
+                    | 'S'
+                    | 'T'
+                    | 'V'
+                    | 'W'
+                    | 'Y'
+            ) {
+                seq.push(up);
+            } else {
+                return Err(PhysicsError::PdbParse(format!(
+                    "Unsupported amino-acid character '{}' in sequence (expected standard 20 AA codes)",
+                    ch
+                )));
+            }
+        }
+    }
+    if seq.len() < 2 {
+        return Err(PhysicsError::PdbParse(
+            "Polypeptide sequence must contain at least 2 amino-acid residues".into(),
+        ));
+    }
+    Ok(seq)
+}
+
 fn one_to_three_letter(aa: char) -> &'static str {
     match aa.to_ascii_uppercase() {
         'A' => "ALA",
@@ -845,5 +899,36 @@ mod tests {
         assert_eq!(reloaded.residue_count, 20);
         assert_eq!(reloaded.sequence_one_letter, "NLYIQWLKDGGPSSGRPPPS");
         assert_eq!(reloaded_coords.len(), topo.atoms.len());
+    }
+
+    #[test]
+    fn sanitize_amino_acid_sequence_strips_fasta_and_rejects_invalid() {
+        let fasta = ">sp|1L2Y|Trp-cage\n nlyiq wlkdg\n gpssg rppps \n";
+        let clean = sanitize_amino_acid_sequence(fasta).expect("valid FASTA sequence");
+        assert_eq!(clean, "NLYIQWLKDGGPSSGRPPPS");
+
+        assert!(sanitize_amino_acid_sequence(">only_header\nA").is_err());
+        assert!(sanitize_amino_acid_sequence("ACDEFX").is_err());
+    }
+
+    #[test]
+    fn build_polypeptide_from_sequence_normalizes_lowercase_glycine() {
+        let (lower_topo, lower_coords) =
+            ProteinTopology::build_polypeptide_from_sequence("g", "agly");
+        let (upper_topo, upper_coords) =
+            ProteinTopology::build_polypeptide_from_sequence("g", "AGLY");
+
+        assert_eq!(lower_topo.atoms.len(), 19);
+        assert_eq!(lower_topo.atoms.len(), upper_topo.atoms.len());
+        assert_eq!(lower_topo.sequence_one_letter, "AGLY");
+        assert_eq!(lower_topo, upper_topo);
+        assert_eq!(lower_coords, upper_coords);
+        assert!(
+            !lower_topo
+                .atoms
+                .iter()
+                .any(|a| a.res_name == "GLY" && a.name == "CB"),
+            "GLY residue must not contain a CB sidechain bead"
+        );
     }
 }

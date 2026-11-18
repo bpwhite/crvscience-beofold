@@ -14,9 +14,10 @@
 // along with this program.  If not, see <https://gnu.org>.
 
 use fold_proto::{
-    derive_cluster_mac_key, AuthenticatedLanFrame, ClusterStateSnapshot, GlobalFederationTelemetry,
-    LanRpcRequest, LanRpcResponse, NodeIdentity, CONTENT_TYPE_RKYV,
+    derive_cluster_id_tag, derive_cluster_mac_key, AuthenticatedLanFrame, ClusterStateSnapshot,
+    GlobalFederationTelemetry, LanRpcRequest, LanRpcResponse, NodeIdentity, CONTENT_TYPE_RKYV,
 };
+use mdns_sd::{ServiceDaemon, ServiceEvent};
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
 use quinn::{
     ClientConfig, Connection, Endpoint, IdleTimeout, ServerConfig, TransportConfig, VarInt,
@@ -28,13 +29,27 @@ use rustls::crypto::{
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
-use std::net::SocketAddr;
+use std::collections::HashSet;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
 const MAX_GUI_RPC_BYTES: usize = 32 * 1024 * 1024;
 const ALPN_BEOFOLD_LAN: &[u8] = b"beofold-lan-v2";
+pub const MDNS_SERVICE_TYPE: &str = "_beofold._udp.local.";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredLanPeer {
+    pub addr: SocketAddr,
+    pub instance: String,
+    pub cluster_tag: String,
+    pub node_short: String,
+    pub tier: String,
+    pub os: String,
+    pub cores: String,
+    pub matches_secret: bool,
+}
 
 /// Live network snapshot shared lock-free / low-contention with the 60 FPS `egui` render thread.
 #[allow(dead_code)]
@@ -45,6 +60,9 @@ pub struct NetworkTelemetryState {
     pub lan_connected: bool,
     pub lan_last_error: Option<String>,
     pub lan_snapshot: Option<ClusterStateSnapshot>,
+    pub lan_discovery_scanning: bool,
+    pub lan_discovery_status: Option<String>,
+    pub discovered_lan_peers: Vec<DiscoveredLanPeer>,
 
     pub wan_sync_url: String,
     pub wan_connected: bool,
@@ -359,4 +377,275 @@ pub fn spawn_network_telemetry_thread(
         .ok();
 
     tx
+}
+
+/// Parses a resolved `_beofold._udp.local.` TXT record & IPv4 addresses into `DiscoveredLanPeer` entries.
+pub fn parse_mdns_peer_record(
+    instance: &str,
+    addrs_v4: &[Ipv4Addr],
+    port: u16,
+    txt_props: &[(&str, &str)],
+    expected_cluster_tag: &str,
+) -> Vec<DiscoveredLanPeer> {
+    if port == 0 {
+        return Vec::new();
+    }
+    let find_prop = |key: &str| -> String {
+        txt_props
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| (*v).to_string())
+            .unwrap_or_default()
+    };
+    let cluster_tag = find_prop("cluster");
+    let node_short = find_prop("node");
+    let tier = find_prop("tier");
+    let os = find_prop("os");
+    let cores = find_prop("cores");
+    let matches_secret = !cluster_tag.is_empty() && cluster_tag == expected_cluster_tag;
+
+    addrs_v4
+        .iter()
+        .filter(|ip| !ip.is_unspecified())
+        .map(|ip| DiscoveredLanPeer {
+            addr: SocketAddr::new(IpAddr::V4(*ip), port),
+            instance: instance.to_string(),
+            cluster_tag: cluster_tag.clone(),
+            node_short: node_short.clone(),
+            tier: if tier.is_empty() { "?".into() } else { tier.clone() },
+            os: if os.is_empty() { "unknown".into() } else { os.clone() },
+            cores: if cores.is_empty() { "?".into() } else { cores.clone() },
+            matches_secret,
+        })
+        .collect()
+}
+
+/// Performs a bounded non-blocking background mDNS browse (`_beofold._udp.local.`) paired with a
+/// fast localhost QUIC probe (`127.0.0.1:7443..=7446`) so 1-click discovery finds local and LAN
+/// Beowulf nodes without blocking the `egui` render loop or hanging offline.
+pub fn spawn_one_click_mdns_scan(
+    cluster_secret: String,
+    wan_sync_url: String,
+    shared: Arc<Mutex<NetworkTelemetryState>>,
+    targets_tx: watch::Sender<PollerTargets>,
+    auto_connect_if_idle: bool,
+) {
+    if let Ok(mut guard) = shared.lock() {
+        if guard.lan_discovery_scanning {
+            return;
+        }
+        guard.lan_discovery_scanning = true;
+        guard.lan_discovery_status = Some("Scanning _beofold._udp.local. (mDNS) + localhost:7443..7446...".into());
+    }
+
+    std::thread::Builder::new()
+        .name("beofold-gui-mdns-scan".into())
+        .spawn(move || {
+            let expected_tag = derive_cluster_id_tag(&cluster_secret);
+            let mut peers: Vec<DiscoveredLanPeer> = Vec::new();
+            let mut seen_addrs: HashSet<SocketAddr> = HashSet::new();
+            let mut mdns_note: Option<String> = None;
+
+            match ServiceDaemon::new() {
+                Ok(mdns) => {
+                    match mdns.browse(MDNS_SERVICE_TYPE) {
+                        Ok(rx) => {
+                            let deadline = Instant::now() + Duration::from_millis(1400);
+                            while Instant::now() < deadline {
+                                let rem = deadline.saturating_duration_since(Instant::now());
+                                match rx.recv_timeout(rem.min(Duration::from_millis(150))) {
+                                    Ok(ServiceEvent::ServiceResolved(resolved)) => {
+                                        let v4s: Vec<Ipv4Addr> =
+                                            resolved.get_addresses_v4().into_iter().collect();
+                                        let cluster_v = resolved
+                                            .get_property_val_str("cluster")
+                                            .unwrap_or("");
+                                        let node_v = resolved
+                                            .get_property_val_str("node")
+                                            .unwrap_or("");
+                                        let tier_v = resolved
+                                            .get_property_val_str("tier")
+                                            .unwrap_or("");
+                                        let os_v = resolved
+                                            .get_property_val_str("os")
+                                            .unwrap_or("");
+                                        let cores_v = resolved
+                                            .get_property_val_str("cores")
+                                            .unwrap_or("");
+                                        let props = [
+                                            ("cluster", cluster_v),
+                                            ("node", node_v),
+                                            ("tier", tier_v),
+                                            ("os", os_v),
+                                            ("cores", cores_v),
+                                        ];
+                                        for p in parse_mdns_peer_record(
+                                            resolved.get_fullname(),
+                                            &v4s,
+                                            resolved.get_port(),
+                                            &props,
+                                            &expected_tag,
+                                        ) {
+                                            if seen_addrs.insert(p.addr) {
+                                                peers.push(p);
+                                            }
+                                        }
+                                    }
+                                    Ok(_) => {}
+                                    Err(_) => break,
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            mdns_note = Some(format!("mDNS browse unavailable: {err}"));
+                        }
+                    }
+                    let _ = mdns.shutdown();
+                }
+                Err(err) => {
+                    mdns_note = Some(format!("mDNS daemon unavailable: {err}"));
+                }
+            }
+
+            // Fast unicast QUIC fallback for localhost ports 7443..=7446 (Windows Firewall resilience)
+            if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                rt.block_on(async {
+                    if let Ok(ep) = build_gui_quic_endpoint() {
+                        let gui_id =
+                            NodeIdentity::from_cluster_secret("gui-supervisor", "discovery");
+                        let gui_pk = gui_id.public_key_bytes();
+                        let mac_key = derive_cluster_mac_key(&cluster_secret);
+                        for port in 7443_u16..=7446_u16 {
+                            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+                            if seen_addrs.contains(&addr) {
+                                continue;
+                            }
+                            let mut cached = None;
+                            if let Ok(Ok(snap)) = tokio::time::timeout(
+                                Duration::from_millis(260),
+                                rpc_query_state(&ep, &mut cached, addr, &mac_key, gui_pk),
+                            )
+                            .await
+                            {
+                                let (tier_s, os_s, cores_s) = snap
+                                    .peers
+                                    .first()
+                                    .map(|p| {
+                                        (
+                                            format!("{}", p.capability.tier),
+                                            p.capability.os.clone(),
+                                            p.capability.logical_cores.to_string(),
+                                        )
+                                    })
+                                    .unwrap_or_else(|| ("?".into(), "local".into(), "?".into()));
+                                if seen_addrs.insert(addr) {
+                                    peers.push(DiscoveredLanPeer {
+                                        addr,
+                                        instance: format!("localhost:{port}"),
+                                        cluster_tag: expected_tag.clone(),
+                                        node_short: "local".into(),
+                                        tier: tier_s,
+                                        os: os_s,
+                                        cores: cores_s,
+                                        matches_secret: true,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+
+            // Sort matching-secret peers first, then by SocketAddr
+            peers.sort_by(|a, b| {
+                b.matches_secret
+                    .cmp(&a.matches_secret)
+                    .then_with(|| a.addr.to_string().cmp(&b.addr.to_string()))
+            });
+
+            let best_match = peers.iter().find(|p| p.matches_secret).map(|p| p.addr);
+            let status_str = if peers.is_empty() {
+                mdns_note.unwrap_or_else(|| {
+                    "No BeoFold peers discovered on _beofold._udp.local. or localhost:7443..7446."
+                        .into()
+                })
+            } else {
+                let matching = peers.iter().filter(|p| p.matches_secret).count();
+                format!(
+                    "Discovered {} LAN peer(s) ({} matching cluster secret).",
+                    peers.len(),
+                    matching
+                )
+            };
+
+            let mut should_send_target: Option<SocketAddr> = None;
+            if let Ok(mut guard) = shared.lock() {
+                guard.lan_discovery_scanning = false;
+                guard.lan_discovery_status = Some(status_str);
+                guard.discovered_lan_peers = peers;
+                if auto_connect_if_idle && !guard.lan_connected {
+                    if let Some(addr) = best_match {
+                        guard.lan_target = addr.to_string();
+                        should_send_target = Some(addr);
+                    }
+                }
+            }
+
+            if let Some(addr) = should_send_target {
+                let wan_opt = if wan_sync_url.trim().is_empty() {
+                    None
+                } else {
+                    Some(wan_sync_url.trim().to_string())
+                };
+                let _ = targets_tx.send(PollerTargets {
+                    lan_peer: Some(addr),
+                    cluster_secret,
+                    wan_sync_url: wan_opt,
+                });
+            }
+        })
+        .ok();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mdns_peer_record_parsing_filters_cluster_secret_and_handles_offline_empty() {
+        let tag = derive_cluster_id_tag("beofold-home-cluster");
+        let addrs = vec![Ipv4Addr::new(192, 168, 1, 42), Ipv4Addr::UNSPECIFIED];
+        let props = [
+            ("cluster", tag.as_str()),
+            ("node", "a1b2c3d4"),
+            ("tier", "S"),
+            ("os", "windows"),
+            ("cores", "24"),
+        ];
+        let peers = parse_mdns_peer_record("beofold-node._beofold._udp.local.", &addrs, 7443, &props, &tag);
+        assert_eq!(peers.len(), 1);
+        assert_eq!(
+            peers[0].addr,
+            "192.168.1.42:7443".parse::<SocketAddr>().unwrap()
+        );
+        assert!(peers[0].matches_secret);
+        assert_eq!(peers[0].tier, "S");
+        assert_eq!(peers[0].cores, "24");
+
+        let mismatched = parse_mdns_peer_record(
+            "other-node._beofold._udp.local.",
+            &[Ipv4Addr::new(192, 168, 1, 99)],
+            7443,
+            &props,
+            "different-tag",
+        );
+        assert_eq!(mismatched.len(), 1);
+        assert!(!mismatched[0].matches_secret);
+
+        let empty_port = parse_mdns_peer_record("bad", &addrs, 0, &props, &tag);
+        assert!(empty_port.is_empty());
+    }
 }

@@ -137,8 +137,12 @@ pub fn compute_2d_pmf_grid(
         .enumerate()
         .map(|(idx, _)| {
             let st = clustering.frame_assignments[idx];
-            let cnt = clustering.microstate_counts[st].max(1) as f64;
-            msm.stationary_pi[st] / cnt
+            if let Some(act_st) = msm.orig_to_active.get(st).copied().flatten() {
+                let cnt = clustering.microstate_counts[st].max(1) as f64;
+                msm.stationary_pi[act_st] / cnt
+            } else {
+                0.0
+            }
         })
         .collect();
 
@@ -201,13 +205,14 @@ fn write_microstate_csv(
         "microstate_id,macrostate_id,frame_count,stationary_pi,free_energy_kcal,committor_p_fold,medoid_wu,medoid_potential_kcal,medoid_rg_ang,medoid_rmsd_best_ang,mean_cluster_radius_ang"
     )?;
     for i in 0..msm.num_microstates {
-        let med = &frames[clustering.medoid_frame_indices[i]];
+        let orig_i = msm.active_microstates[i];
+        let med = &frames[clustering.medoid_frame_indices[orig_i]];
         writeln!(
             w,
             "{},{},{},{:.6},{:.4},{:.4},{},{:.3},{:.3},{:.3},{:.3}",
             i,
             msm.microstate_to_macrostate[i],
-            clustering.microstate_counts[i],
+            clustering.microstate_counts[orig_i],
             msm.stationary_pi[i],
             msm.microstate_free_energy_kcal[i],
             msm.folding_committor[i],
@@ -215,7 +220,7 @@ fn write_microstate_csv(
             med.potential_energy_kcal,
             med.rg_angstrom,
             med.rmsd_to_lowest_energy_ang,
-            clustering.mean_cluster_radius_ang[i]
+            clustering.mean_cluster_radius_ang[orig_i]
         )?;
     }
     w.flush()?;
@@ -315,13 +320,15 @@ fn write_academic_landscape_svg(
     };
 
     for i in 0..msm.num_microstates {
+        let orig_i = msm.active_microstates[i];
         for j in (i + 1)..msm.num_microstates {
             let flux = msm.stationary_pi[i] * msm.transition_matrix[i][j];
             if flux < 0.004 {
                 continue;
             }
-            let mi = &frames[clustering.medoid_frame_indices[i]];
-            let mj = &frames[clustering.medoid_frame_indices[j]];
+            let orig_j = msm.active_microstates[j];
+            let mi = &frames[clustering.medoid_frame_indices[orig_i]];
+            let mj = &frames[clustering.medoid_frame_indices[orig_j]];
             let (x1, y1) = map_xy(mi.rmsd_to_lowest_energy_ang, mi.rg_angstrom);
             let (x2, y2) = map_xy(mj.rmsd_to_lowest_energy_ang, mj.rg_angstrom);
             let stroke_w = (0.8 + 18.0 * flux).clamp(0.8, 4.2);
@@ -333,7 +340,8 @@ fn write_academic_landscape_svg(
     }
 
     for i in 0..msm.num_microstates {
-        let med = &frames[clustering.medoid_frame_indices[i]];
+        let orig_i = msm.active_microstates[i];
+        let med = &frames[clustering.medoid_frame_indices[orig_i]];
         let (cx, cy) = map_xy(med.rmsd_to_lowest_energy_ang, med.rg_angstrom);
         let rad = (5.0 + 18.0 * msm.stationary_pi[i].sqrt()).clamp(5.0, 16.0);
         let fill = committor_hex(msm.folding_committor[i]);

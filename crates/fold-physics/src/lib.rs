@@ -38,11 +38,12 @@ pub use mremd::{
 };
 pub use rng::ChaCha8Rng;
 pub use sanity::{
-    compute_ca_rmsd, compute_radius_of_gyration, verify_checkpoint_sanity, SanityError,
-    SanityThresholds,
+    compute_ca_rmsd, compute_radius_of_gyration, fraction_native_contacts, native_ca_contact_pairs,
+    verify_checkpoint_sanity, SanityError, SanityThresholds,
 };
 pub use topology::{
-    AngleTerm, AtomRecord, BondTerm, ExclusionPolicy, PhysicsError, ProteinTopology, TorsionTerm,
+    sanitize_amino_acid_sequence, AngleTerm, AtomRecord, BondTerm, ExclusionPolicy, PhysicsError,
+    ProteinTopology, TorsionTerm,
 };
 
 /// Exact conversion factor from `[kcal / (mol * A)] / [amu]` to `[A / ps^2]`.

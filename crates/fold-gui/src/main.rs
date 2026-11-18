@@ -16,6 +16,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod icon;
 mod lan_client;
 mod live_sandbox;
 mod msm_tab;
@@ -81,76 +82,49 @@ fn block_on_future<F: std::future::Future>(fut: F) -> F::Output {
     }
 }
 
-fn png_crc32(bytes: &[u8]) -> u32 {
-    let mut c = 0xFFFF_FFFF_u32;
-    for &b in bytes {
-        c ^= b as u32;
-        for _ in 0..8 {
-            c = if (c & 1) != 0 {
-                0xEDB8_8320_u32 ^ (c >> 1)
-            } else {
-                c >> 1
-            };
-        }
-    }
-    !c
-}
-
-fn push_png_chunk(out: &mut Vec<u8>, tag: &[u8; 4], data: &[u8]) {
-    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
-    let start = out.len();
-    out.extend_from_slice(tag);
-    out.extend_from_slice(data);
-    out.extend_from_slice(&png_crc32(&out[start..]).to_be_bytes());
-}
-
 fn write_rgba_png(
     path: &std::path::Path,
     width: u32,
     height: u32,
     rgba: &[u8],
 ) -> Result<(), String> {
-    let row_bytes = (width as usize) * 4;
-    if rgba.len() != row_bytes * (height as usize) {
+    let expected = (width as usize) * (height as usize) * 4;
+    if rgba.len() != expected {
         return Err("RGBA buffer length mismatch".to_string());
     }
-    let mut raw = Vec::with_capacity((row_bytes + 1) * (height as usize));
-    for row in rgba.chunks_exact(row_bytes) {
-        raw.push(0);
-        raw.extend_from_slice(row);
-    }
-    let mut zlib = Vec::with_capacity(raw.len() + 256);
-    zlib.extend_from_slice(&[0x78, 0x01]);
-    let mut chunks = raw.chunks(65_535).peekable();
-    while let Some(chunk) = chunks.next() {
-        zlib.push(if chunks.peek().is_none() { 0x01 } else { 0x00 });
-        let len = chunk.len() as u16;
-        zlib.extend_from_slice(&len.to_le_bytes());
-        zlib.extend_from_slice(&(!len).to_le_bytes());
-        zlib.extend_from_slice(chunk);
-    }
-    let (mut s1, mut s2) = (1_u32, 0_u32);
-    for &b in &raw {
-        s1 = (s1 + b as u32) % 65_521;
-        s2 = (s2 + s1) % 65_521;
-    }
-    zlib.extend_from_slice(&((s2 << 16) | s1).to_be_bytes());
-    let mut png = Vec::with_capacity(zlib.len() + 64);
-    png.extend_from_slice(b"\x89PNG\r\n\x1a\n");
-    let mut ihdr = Vec::with_capacity(13);
-    ihdr.extend_from_slice(&width.to_be_bytes());
-    ihdr.extend_from_slice(&height.to_be_bytes());
-    ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
-    push_png_chunk(&mut png, b"IHDR", &ihdr);
-    push_png_chunk(&mut png, b"IDAT", &zlib);
-    push_png_chunk(&mut png, b"IEND", &[]);
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("Failed to create directory: {e}"))?;
         }
     }
-    std::fs::write(path, &png).map_err(|e| format!("Failed to write PNG: {e}"))
+    let file = std::fs::File::create(path)
+        .map_err(|e| format!("Failed to create PNG {}: {e}", path.display()))?;
+    let w = std::io::BufWriter::new(file);
+    let mut encoder = png::Encoder::new(w, width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder.set_compression(png::Compression::High);
+    let mut writer = encoder
+        .write_header()
+        .map_err(|e| format!("PNG header error: {e}"))?;
+    writer
+        .write_image_data(rgba)
+        .map_err(|e| format!("PNG encode error: {e}"))
+}
+
+#[cfg(windows)]
+fn attach_parent_console_if_cli() {
+    if std::env::args_os().len() > 1 {
+        const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+        extern "system" {
+            fn AttachConsole(dw_process_id: u32) -> i32;
+        }
+        // Attach stdout/stderr to parent console for CLI invocations while keeping GUI launches window-only.
+        unsafe {
+            let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+        }
+    }
 }
 
 fn run_headless_screenshot(
@@ -314,6 +288,9 @@ fn run_headless_screenshot(
 }
 
 fn main() -> eframe::Result<()> {
+    #[cfg(windows)]
+    attach_parent_console_if_cli();
+
     let cli = GuiCli::parse();
     let launch_cfg = GuiLaunchConfig {
         lan_peer: cli.lan_peer,
@@ -343,7 +320,12 @@ fn main() -> eframe::Result<()> {
 
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("BeoFold v1.3 — Distributed Protein Folding & MSM Supervisor")
+            .with_title(concat!(
+                "BeoFold v",
+                env!("CARGO_PKG_VERSION"),
+                " — Distributed Protein Folding & MSM Supervisor"
+            ))
+            .with_icon(std::sync::Arc::new(icon::beofold_icon_data()))
             .with_inner_size([1400.0, 860.0])
             .with_min_inner_size([1020.0, 640.0]),
         ..Default::default()

@@ -51,6 +51,14 @@ pub struct ReversibleMsmModel {
     pub microstate_to_macrostate: Vec<usize>,
     /// Fuzzy PCCA+ simplex membership matrix `chi[microstate][macrostate]` (`sum_A chi_{i,A} = 1`).
     pub fuzzy_memberships: Vec<Vec<f64>>,
+    /// Maps active MSM microstate index `0..num_microstates` -> original `MicrostateClustering` index.
+    pub active_microstates: Vec<usize>,
+    /// Maps original `MicrostateClustering` index `0..clustering.num_microstates` -> active MSM index.
+    pub orig_to_active: Vec<Option<usize>>,
+    /// Original clustering microstate indices pruned during Tarjan SCC / cold-rung filtering.
+    pub pruned_microstates: Vec<usize>,
+    /// Röblitz–Weber PCCA+ linear transformation matrix `A` (`M x M`) satisfying `chi = Psi * A`.
+    pub pcca_transform_a: Vec<Vec<f64>>,
 }
 
 #[derive(Debug, Clone)]
@@ -68,8 +76,9 @@ pub struct MetastableMacrostate {
 }
 
 /// Counts sequential transitions `(state(t) -> state(t + lag_generations))` strictly within each
-/// independent `(Project, Run, Clone)` trajectory chain and estimates a reversible detailed-balance
-/// Markov State Model via Prinz-Noé fixed-point MLE + Cyclic Jacobi eigendecomposition + PCCA+.
+/// independent `(Project, Run, Clone)` trajectory chain (filtering to cold MREMD rungs `T <= T_ref + 25 K`
+/// with safe fallback if no cold transitions exist), prunes to the largest ergodic Tarjan SCC, and
+/// estimates a reversible detailed-balance MSM via Prinz-Noé MLE + Cyclic Jacobi + Röblitz–Weber PCCA+.
 pub fn estimate_reversible_msm(
     frames: &[ConformationalFrame],
     clustering: &MicrostateClustering,
@@ -78,7 +87,30 @@ pub fn estimate_reversible_msm(
     reference_temp_kelvin: f64,
     requested_macrostates: usize,
 ) -> Result<ReversibleMsmModel, MsmError> {
-    let k = clustering.num_microstates;
+    estimate_reversible_msm_with_max_temp(
+        frames,
+        clustering,
+        lag_generations,
+        lag_time_ps,
+        reference_temp_kelvin,
+        requested_macrostates,
+        None,
+    )
+}
+
+/// Estimates a reversible detailed-balance MSM with an optional explicit upper temperature cutoff
+/// (`max_temperature_kelvin`). When `None`, defaults to `reference_temp_kelvin + 25.0 K` with
+/// automatic fallback to all temperatures if fewer than 2 connected microstates exist below cutoff.
+pub fn estimate_reversible_msm_with_max_temp(
+    frames: &[ConformationalFrame],
+    clustering: &MicrostateClustering,
+    lag_generations: u32,
+    lag_time_ps: f64,
+    reference_temp_kelvin: f64,
+    requested_macrostates: usize,
+    max_temperature_kelvin: Option<f64>,
+) -> Result<ReversibleMsmModel, MsmError> {
+    let k_orig = clustering.num_microstates;
     let lag = lag_generations.max(1);
 
     // Group frame indices by `(run, clone)` chain
@@ -89,42 +121,87 @@ pub fn estimate_reversible_msm(
             .or_default()
             .push(idx);
     }
-
-    let mut counts = vec![vec![0u64; k]; k];
-    let mut total_transitions = 0u64;
-
     for chain_indices in chains.values_mut() {
         chain_indices.sort_by_key(|&idx| frames[idx].chain_step);
-        // Map `chain_step -> frame_idx` for exact `step -> step + lag` lookup
-        let step_map: HashMap<u32, usize> = chain_indices
-            .iter()
-            .map(|&idx| (frames[idx].chain_step, idx))
-            .collect();
+    }
 
-        for &idx_a in chain_indices.iter() {
-            let target_step = frames[idx_a].chain_step + lag;
-            if let Some(&idx_b) = step_map.get(&target_step) {
-                let s_a = clustering.frame_assignments[idx_a];
-                let s_b = clustering.frame_assignments[idx_b];
-                counts[s_a][s_b] += 1;
-                total_transitions += 1;
+    let default_cold_tmax = reference_temp_kelvin + 25.0;
+    let (counts_orig, total_transitions) = match max_temperature_kelvin {
+        Some(tmax) => count_chain_transitions(frames, clustering, &chains, lag, k_orig, Some(tmax)),
+        None => {
+            let (cold_counts, cold_total) = count_chain_transitions(
+                frames,
+                clustering,
+                &chains,
+                lag,
+                k_orig,
+                Some(default_cold_tmax),
+            );
+            let cold_has_ergodic_core = cold_total > 0
+                && (tarjan_largest_scc(&cold_counts).len() >= 2
+                    || largest_undirected_component(&cold_counts).len() >= 2);
+            if cold_has_ergodic_core {
+                (cold_counts, cold_total)
+            } else {
+                count_chain_transitions(frames, clustering, &chains, lag, k_orig, None)
             }
         }
-    }
+    };
 
     if total_transitions == 0 {
         return Err(MsmError::ZeroTransitions { lag });
     }
 
-    // Prinz-Noé-Pande Iterative Fixed-Point Reversible Detailed-Balance MLE:
-    // Weak symmetric connectivity prior (`1e-5`) prevents reducible disconnected subgraphs on sparse vaults
-    // while preserving high-count transition rates to >99.99%.
-    let prior_eps = 1.0e-5f64;
+    // Tarjan SCC largest ergodic component pruning (zero dense `prior_eps` pseudocounts)
+    let best_scc = tarjan_largest_scc(&counts_orig);
+    let (active_microstates, is_strict_scc) = if best_scc.len() >= 2 {
+        (best_scc, true)
+    } else {
+        let best_ucc = largest_undirected_component(&counts_orig);
+        if best_ucc.len() < 2 {
+            return Err(MsmError::ZeroTransitions { lag });
+        }
+        (best_ucc, false)
+    };
+
+    let k = active_microstates.len();
+    let mut orig_to_active = vec![None; k_orig];
+    for (act_idx, &orig_idx) in active_microstates.iter().enumerate() {
+        orig_to_active[orig_idx] = Some(act_idx);
+    }
+    let pruned_microstates: Vec<usize> = (0..k_orig)
+        .filter(|&orig_idx| orig_to_active[orig_idx].is_none())
+        .collect();
+
+    let mut counts = vec![vec![0u64; k]; k];
+    let mut active_total_transitions = 0u64;
+    for (a_i, &orig_i) in active_microstates.iter().enumerate() {
+        for (a_j, &orig_j) in active_microstates.iter().enumerate() {
+            let c = counts_orig[orig_i][orig_j];
+            counts[a_i][a_j] = c;
+            active_total_transitions += c;
+        }
+    }
+    if active_total_transitions == 0 {
+        return Err(MsmError::ZeroTransitions { lag });
+    }
+
+    // Prinz-Noé-Pande Iterative Fixed-Point Reversible Detailed-Balance MLE strictly on the
+    // ergodic Tarjan SCC (zero dense off-diagonal pseudocounts).
     let mut c_reg = vec![vec![0.0f64; k]; k];
     for i in 0..k {
         for j in 0..k {
-            let diag_boost = if i == j { 1.0e-4 } else { prior_eps };
-            c_reg[i][j] = (counts[i][j] as f64) + diag_boost;
+            c_reg[i][j] = counts[i][j] as f64;
+        }
+    }
+    if !is_strict_scc {
+        // For strictly acyclic trajectories where max SCC < 2, add minimal diagonal-only
+        // self-loop stabilizer only on zero-out-degree sink states to keep MLE well-defined.
+        for i in 0..k {
+            let row_sum: f64 = c_reg[i].iter().sum();
+            if row_sum <= 0.0 {
+                c_reg[i][i] = 1.0e-12;
+            }
         }
     }
 
@@ -221,11 +298,11 @@ pub fn estimate_reversible_msm(
             right_eigenvectors[mode][i] =
                 sym_eigvecs[i][mode] / stationary_pi[i].max(1e-30).sqrt();
         }
-        // Normalize mode 0 to +1 convention
-        if mode == 0 && right_eigenvectors[0][0] < 0.0 {
-            for val in &mut right_eigenvectors[0] {
-                *val = -*val;
-            }
+    }
+    // Enforce exact Perron constant right eigenvector `psi_0 = +1` across all active states
+    if k > 0 {
+        for val in &mut right_eigenvectors[0] {
+            *val = 1.0;
         }
     }
 
@@ -244,9 +321,9 @@ pub fn estimate_reversible_msm(
     let mut unfolded_src = 0usize;
     let mut folded_snk = 0usize;
     for m in 1..k {
-        let f_m = &frames[clustering.medoid_frame_indices[m]];
-        let f_u = &frames[clustering.medoid_frame_indices[unfolded_src]];
-        let f_f = &frames[clustering.medoid_frame_indices[folded_snk]];
+        let f_m = &frames[clustering.medoid_frame_indices[active_microstates[m]]];
+        let f_u = &frames[clustering.medoid_frame_indices[active_microstates[unfolded_src]]];
+        let f_f = &frames[clustering.medoid_frame_indices[active_microstates[folded_snk]]];
         if f_m.rg_angstrom > f_u.rg_angstrom {
             unfolded_src = m;
         }
@@ -261,24 +338,26 @@ pub fn estimate_reversible_msm(
     let folding_committor =
         solve_forward_committor(&transition_matrix, unfolded_src, folded_snk);
 
-    // PCCA+ Simplex Spectral Coarse-Graining into `M` Metastable Macrostates
-    let num_macro = requested_macrostates.clamp(2, k.max(2));
-    let (fuzzy_memberships, microstate_to_macrostate, macrostates) = build_pcca_macrostates(
-        frames,
-        clustering,
-        &stationary_pi,
-        &right_eigenvectors,
-        &folding_committor,
-        num_macro,
-        kbt,
-    );
+    // Röblitz–Weber PCCA+ Inner-Simplex Spectral Coarse-Graining (`chi = Psi * A`)
+    let num_macro = requested_macrostates.min(k).max(2);
+    let (fuzzy_memberships, microstate_to_macrostate, macrostates, pcca_transform_a) =
+        build_pcca_macrostates(
+            frames,
+            clustering,
+            &active_microstates,
+            &stationary_pi,
+            &right_eigenvectors,
+            &folding_committor,
+            num_macro,
+            kbt,
+        );
 
     Ok(ReversibleMsmModel {
         num_microstates: k,
         lag_generations: lag,
         lag_time_ps,
         reference_temp_kelvin,
-        total_transitions,
+        total_transitions: active_total_transitions,
         count_matrix: counts,
         transition_matrix,
         stationary_pi,
@@ -293,7 +372,164 @@ pub fn estimate_reversible_msm(
         macrostates,
         microstate_to_macrostate,
         fuzzy_memberships,
+        active_microstates,
+        orig_to_active,
+        pruned_microstates,
+        pcca_transform_a,
     })
+}
+
+fn count_chain_transitions(
+    frames: &[ConformationalFrame],
+    clustering: &MicrostateClustering,
+    chains: &HashMap<(u32, u32), Vec<usize>>,
+    lag: u32,
+    k: usize,
+    max_temp_kelvin: Option<f64>,
+) -> (Vec<Vec<u64>>, u64) {
+    let mut counts = vec![vec![0u64; k]; k];
+    let mut total_transitions = 0u64;
+
+    for chain_indices in chains.values() {
+        let step_map: HashMap<u32, usize> = chain_indices
+            .iter()
+            .map(|&idx| (frames[idx].chain_step, idx))
+            .collect();
+
+        for &idx_a in chain_indices {
+            if let Some(tmax) = max_temp_kelvin {
+                if frames[idx_a].temperature_kelvin > tmax {
+                    continue;
+                }
+            }
+            let target_step = frames[idx_a].chain_step + lag;
+            if let Some(&idx_b) = step_map.get(&target_step) {
+                if let Some(tmax) = max_temp_kelvin {
+                    if frames[idx_b].temperature_kelvin > tmax {
+                        continue;
+                    }
+                }
+                let s_a = clustering.frame_assignments[idx_a];
+                let s_b = clustering.frame_assignments[idx_b];
+                counts[s_a][s_b] += 1;
+                total_transitions += 1;
+            }
+        }
+    }
+
+    (counts, total_transitions)
+}
+
+/// Tarjan's Strongly Connected Components algorithm on directed count graph `counts[i][j] > 0`.
+/// Returns the largest SCC (tie-broken by total internal transition counts, then sorted node order).
+fn tarjan_largest_scc(counts: &[Vec<u64>]) -> Vec<usize> {
+    let n = counts.len();
+    struct TarjanState {
+        next_index: usize,
+        indices: Vec<Option<usize>>,
+        lowlink: Vec<usize>,
+        on_stack: Vec<bool>,
+        stack: Vec<usize>,
+        sccs: Vec<Vec<usize>>,
+    }
+
+    fn strongconnect(v: usize, counts: &[Vec<u64>], st: &mut TarjanState) {
+        st.indices[v] = Some(st.next_index);
+        st.lowlink[v] = st.next_index;
+        st.next_index += 1;
+        st.stack.push(v);
+        st.on_stack[v] = true;
+
+        for w in 0..counts.len() {
+            if counts[v][w] == 0 {
+                continue;
+            }
+            if st.indices[w].is_none() {
+                strongconnect(w, counts, st);
+                st.lowlink[v] = st.lowlink[v].min(st.lowlink[w]);
+            } else if st.on_stack[w] {
+                st.lowlink[v] = st.lowlink[v].min(st.indices[w].unwrap());
+            }
+        }
+
+        if Some(st.lowlink[v]) == st.indices[v] {
+            let mut scc = Vec::new();
+            while let Some(w) = st.stack.pop() {
+                st.on_stack[w] = false;
+                scc.push(w);
+                if w == v {
+                    break;
+                }
+            }
+            scc.sort_unstable();
+            st.sccs.push(scc);
+        }
+    }
+
+    let mut st = TarjanState {
+        next_index: 0,
+        indices: vec![None; n],
+        lowlink: vec![0; n],
+        on_stack: vec![false; n],
+        stack: Vec::new(),
+        sccs: Vec::new(),
+    };
+
+    for v in 0..n {
+        if st.indices[v].is_none() {
+            strongconnect(v, counts, &mut st);
+        }
+    }
+
+    let scc_weight = |comp: &[usize]| -> u64 {
+        let mut sum = 0u64;
+        for &u in comp {
+            for &v in comp {
+                sum += counts[u][v];
+            }
+        }
+        sum
+    };
+
+    st.sccs
+        .into_iter()
+        .max_by(|a, b| {
+            a.len()
+                .cmp(&b.len())
+                .then_with(|| scc_weight(a).cmp(&scc_weight(b)))
+                .then_with(|| b.cmp(a))
+        })
+        .unwrap_or_default()
+}
+
+/// Largest connected component of the undirected symmetrized graph `(counts[i][j] + counts[j][i]) > 0`.
+fn largest_undirected_component(counts: &[Vec<u64>]) -> Vec<usize> {
+    let n = counts.len();
+    let mut visited = vec![false; n];
+    let mut best: Vec<usize> = Vec::new();
+
+    for start in 0..n {
+        if visited[start] {
+            continue;
+        }
+        let mut stack = vec![start];
+        visited[start] = true;
+        let mut comp = Vec::new();
+        while let Some(u) = stack.pop() {
+            comp.push(u);
+            for v in 0..n {
+                if !visited[v] && (counts[u][v] > 0 || counts[v][u] > 0) {
+                    visited[v] = true;
+                    stack.push(v);
+                }
+            }
+        }
+        comp.sort_unstable();
+        if comp.len() > best.len() {
+            best = comp;
+        }
+    }
+    best
 }
 
 /// Pure-Rust Cyclic Jacobi Symmetric Eigensolver (`A = V * diag(eigenvalues) * V^T`),
@@ -450,33 +686,41 @@ fn gaussian_solve(mut a: Vec<Vec<f64>>, mut b: Vec<f64>) -> Option<Vec<f64>> {
     Some(x)
 }
 
-/// PCCA+ Simplex Spectral Coarse-Graining:
-/// Embeds microstates in the `(M - 1)` dominant slow right eigenvectors `(psi_1 .. psi_{M-1})`,
-/// identifies `M` extreme simplex vertices via furthest-point selection, computes fuzzy simplex
-/// memberships `chi_{i, A}` via inverse-distance / barycentric projection, and orders macrostates
-/// from lowest free energy (`Macrostate 0`) upward.
+/// True Röblitz–Weber (2013) Inner-Simplex PCCA+ Spectral Coarse-Graining (`chi = Psi * A`):
+/// Embeds active microstates in `M` dominant slow right eigenvectors `Psi = [psi_0=1, psi_1, ..., psi_{M-1}]`,
+/// finds `M` extreme simplex vertices via Inner Simplex Algorithm (ISA) orthogonal-projection pivoting,
+/// inverts `Psi_verts` to seed `A^(0)`, optimizes `A` over the feasible non-negative simplex polytope
+/// to maximize crispness `I(A) = sum_{a,r} A_{r,a}^2 / A_{0,a}` (satisfying `chi = Psi * A >= 0`,
+/// `sum_a chi_{i,a} = 1`), and orders macrostates by descending equilibrium population `Pi_A`.
+#[allow(clippy::too_many_arguments)]
 fn build_pcca_macrostates(
     frames: &[ConformationalFrame],
     clustering: &MicrostateClustering,
+    active_microstates: &[usize],
     stationary_pi: &[f64],
     right_eigenvectors: &[Vec<f64>],
     committor: &[f64],
     num_macro: usize,
     kbt: f64,
-) -> (Vec<Vec<f64>>, Vec<usize>, Vec<MetastableMacrostate>) {
+) -> (Vec<Vec<f64>>, Vec<usize>, Vec<MetastableMacrostate>, Vec<Vec<f64>>) {
     let k = stationary_pi.len();
-    let dim = (num_macro - 1).min(k.saturating_sub(1)).max(1);
+    let m = num_macro.min(k).max(2);
 
-    let coords: Vec<Vec<f64>> = (0..k)
-        .map(|i| (1..=dim).map(|mode| right_eigenvectors[mode][i]).collect())
-        .collect();
+    // Form `Psi` (`k x m`) with `psi[i][0] = 1.0` and `psi[i][r] = right_eigenvectors[r][i]`
+    let mut psi = vec![vec![0.0f64; m]; k];
+    for i in 0..k {
+        psi[i][0] = 1.0;
+        for r in 1..m {
+            psi[i][r] = right_eigenvectors[r][i];
+        }
+    }
 
-    // Seed Vertex 0 as microstate with largest slow-subspace norm
-    let mut vertices: Vec<usize> = Vec::with_capacity(num_macro);
+    // Step 1: Inner Simplex Algorithm (ISA) vertex pivoting in `R^m`
+    let mut vertices: Vec<usize> = Vec::with_capacity(m);
     let mut v0 = 0usize;
     let mut max_n2 = -1.0f64;
-    for (i, pt) in coords.iter().enumerate() {
-        let n2: f64 = pt.iter().map(|x| x * x).sum();
+    for (i, row) in psi.iter().enumerate() {
+        let n2: f64 = row.iter().skip(1).map(|x| x * x).sum();
         if n2 > max_n2 {
             max_n2 = n2;
             v0 = i;
@@ -484,82 +728,165 @@ fn build_pcca_macrostates(
     }
     vertices.push(v0);
 
-    while vertices.len() < num_macro {
+    // Subtract `psi[v0]` so all translated vectors lie in `span(psi_1..psi_{m-1})`
+    let mut orth: Vec<Vec<f64>> = (0..k)
+        .map(|i| (0..m).map(|r| psi[i][r] - psi[v0][r]).collect())
+        .collect();
+
+    while vertices.len() < m {
         let mut best_idx = 0usize;
-        let mut best_min_d2 = -1.0f64;
-        for i in 0..k {
+        let mut best_n2 = -1.0f64;
+        for (i, row) in orth.iter().enumerate() {
             if vertices.contains(&i) {
                 continue;
             }
-            let min_d2 = vertices
-                .iter()
-                .map(|&v| sq_dist(&coords[i], &coords[v]))
-                .fold(f64::INFINITY, f64::min);
-            if min_d2 > best_min_d2 {
-                best_min_d2 = min_d2;
+            let n2: f64 = row.iter().map(|x| x * x).sum();
+            if n2 > best_n2 {
+                best_n2 = n2;
                 best_idx = i;
             }
         }
         vertices.push(best_idx);
+
+        if vertices.len() < m {
+            let dir = orth[best_idx].clone();
+            let norm = dir.iter().map(|x| x * x).sum::<f64>().sqrt();
+            if norm > 1.0e-12 {
+                let u: Vec<f64> = dir.into_iter().map(|x| x / norm).collect();
+                for row in &mut orth {
+                    let dot: f64 = row.iter().zip(u.iter()).map(|(a, b)| a * b).sum();
+                    for r in 0..m {
+                        row[r] -= dot * u[r];
+                    }
+                }
+            }
+        }
     }
 
-    // Compute fuzzy PCCA+ simplex memberships `chi[i][A]` (`sum_A chi[i][A] == 1.0`)
-    let mut raw_chi = vec![vec![0.0f64; num_macro]; k];
-    for i in 0..k {
-        if let Some(pos) = vertices.iter().position(|&v| v == i) {
-            raw_chi[i][pos] = 1.0;
-        } else {
-            let mut inv_sum = 0.0f64;
-            for (m_idx, &v) in vertices.iter().enumerate() {
-                let d = sq_dist(&coords[i], &coords[v]).sqrt().max(1.0e-6);
-                let w = 1.0 / (d * d);
-                raw_chi[i][m_idx] = w;
-                inv_sum += w;
+    // Step 2: Seed `A^(0) = Psi_verts^{-1}`
+    let psi_verts: Vec<Vec<f64>> = vertices.iter().map(|&v| psi[v].clone()).collect();
+    let mut best_a = invert_square_matrix(&psi_verts).unwrap_or_else(|| {
+        let mut eye = vec![vec![0.0f64; m]; m];
+        for c in 0..m {
+            eye[0][c] = 1.0 / (m as f64);
+        }
+        eye
+    });
+
+    // Enforce exact inner-simplex feasibility & normalize `A^(0)` via `fill_a`
+    let mut best_crisp = fill_a_matrix(&psi, &mut best_a).unwrap_or_else(|| {
+        best_a = vec![vec![0.0f64; m]; m];
+        for c in 0..m {
+            best_a[0][c] = 1.0 / (m as f64);
+        }
+        1.0
+    });
+
+    // Step 3: Optimize Röblitz–Weber crispness `I(A) = sum_{a,r} A_{r,a}^2 / A_{0,a}`
+    // over the `(m - 1) * (m - 1)` free subspace parameters via multi-scale coordinate pattern search.
+    if m >= 2 {
+        let mut candidate = best_a.clone();
+        for &step_scale in &[0.25_f64, 0.08, 0.025, 0.008, 0.002, 0.0005] {
+            for _pass in 0..6 {
+                let mut improved = false;
+                for r in 1..m {
+                    for c in 0..(m - 1) {
+                        let base_val = best_a[r][c];
+                        let delta = step_scale * base_val.abs().max(0.2);
+                        for dir in [-1.0_f64, 1.0_f64] {
+                            candidate.clone_from(&best_a);
+                            candidate[r][c] = base_val + dir * delta;
+                            if let Some(crisp) = fill_a_matrix(&psi, &mut candidate) {
+                                if crisp > best_crisp + 1.0e-10 {
+                                    best_crisp = crisp;
+                                    best_a.clone_from(&candidate);
+                                    improved = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                if !improved {
+                    break;
+                }
             }
-            for m_idx in 0..num_macro {
-                raw_chi[i][m_idx] /= inv_sum.max(1.0e-30);
+        }
+    }
+
+    // Step 4: Evaluate exact linear subspace projection `chi = Psi * A`
+    let mut raw_chi = vec![vec![0.0f64; m]; k];
+    for i in 0..k {
+        let mut row_sum = 0.0f64;
+        for a in 0..m {
+            let mut v = 0.0f64;
+            for r in 0..m {
+                v += psi[i][r] * best_a[r][a];
+            }
+            if v < 0.0 && v > -1.0e-11 {
+                v = 0.0;
+            }
+            raw_chi[i][a] = v.max(0.0);
+            row_sum += raw_chi[i][a];
+        }
+        if row_sum > 1.0e-30 && (row_sum - 1.0).abs() > 1.0e-13 {
+            for a in 0..m {
+                raw_chi[i][a] /= row_sum;
             }
         }
     }
 
     // Order macrostates by descending stationary population `Pi_A = sum_i pi_i * chi[i][A]`
-    let raw_pops: Vec<f64> = (0..num_macro)
+    let raw_pops: Vec<f64> = (0..m)
         .map(|a| (0..k).map(|i| stationary_pi[i] * raw_chi[i][a]).sum())
         .collect();
-    let mut macro_order: Vec<usize> = (0..num_macro).collect();
+    let mut macro_order: Vec<usize> = (0..m).collect();
     macro_order.sort_by(|&a, &b| {
         raw_pops[b]
             .partial_cmp(&raw_pops[a])
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    let mut fuzzy_memberships = vec![vec![0.0f64; num_macro]; k];
+    let mut reordered_a = vec![vec![0.0f64; m]; m];
+    for r in 0..m {
+        for (new_a, &old_a) in macro_order.iter().enumerate() {
+            reordered_a[r][new_a] = best_a[r][old_a];
+        }
+    }
+
+    let mut fuzzy_memberships = vec![vec![0.0f64; m]; k];
     let mut crisp_assign = vec![0usize; k];
     for i in 0..k {
-        let mut best_a = 0usize;
+        let mut best_a_idx = 0usize;
         let mut best_w = -1.0f64;
         for (new_a, &old_a) in macro_order.iter().enumerate() {
             let w = raw_chi[i][old_a];
             fuzzy_memberships[i][new_a] = w;
             if w > best_w {
                 best_w = w;
-                best_a = new_a;
+                best_a_idx = new_a;
             }
         }
-        crisp_assign[i] = best_a;
+        crisp_assign[i] = best_a_idx;
     }
 
     let max_pop = raw_pops.iter().cloned().fold(0.0f64, f64::max).max(1e-30);
-    let mut macrostates = Vec::with_capacity(num_macro);
+    let mut macrostates = Vec::with_capacity(m);
 
-    for new_a in 0..num_macro {
+    for new_a in 0..m {
         let old_a = macro_order[new_a];
         let pop = raw_pops[old_a].max(1e-30);
         let fe_kcal = -kbt * (pop / max_pop).ln();
 
         let members: Vec<usize> = (0..k).filter(|&i| crisp_assign[i] == new_a).collect();
         let active_set = if members.is_empty() {
-            vec![vertices[old_a]]
+            let argmax_i = (0..k)
+                .max_by(|&ia, &ib| {
+                    fuzzy_memberships[ia][new_a]
+                        .partial_cmp(&fuzzy_memberships[ib][new_a])
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .unwrap_or(0);
+            vec![argmax_i]
         } else {
             members.clone()
         };
@@ -567,13 +894,13 @@ fn build_pcca_macrostates(
         // Pick representative frame = lowest potential energy medoid inside this macrostate
         let mut rep_micro = active_set[0];
         for &m_st in &active_set[1..] {
-            let f_cand = &frames[clustering.medoid_frame_indices[m_st]];
-            let f_cur = &frames[clustering.medoid_frame_indices[rep_micro]];
+            let f_cand = &frames[clustering.medoid_frame_indices[active_microstates[m_st]]];
+            let f_cur = &frames[clustering.medoid_frame_indices[active_microstates[rep_micro]]];
             if f_cand.potential_energy_kcal < f_cur.potential_energy_kcal {
                 rep_micro = m_st;
             }
         }
-        let rep_frame_idx = clustering.medoid_frame_indices[rep_micro];
+        let rep_frame_idx = clustering.medoid_frame_indices[active_microstates[rep_micro]];
 
         let mut w_sum = 0.0f64;
         let mut rg_acc = 0.0f64;
@@ -582,7 +909,7 @@ fn build_pcca_macrostates(
         let mut comm_acc = 0.0f64;
         for i in 0..k {
             let w = stationary_pi[i] * fuzzy_memberships[i][new_a];
-            let med = &frames[clustering.medoid_frame_indices[i]];
+            let med = &frames[clustering.medoid_frame_indices[active_microstates[i]]];
             w_sum += w;
             rg_acc += w * med.rg_angstrom;
             rmsd_acc += w * med.rmsd_to_lowest_energy_ang;
@@ -614,17 +941,127 @@ fn build_pcca_macrostates(
         });
     }
 
-    (fuzzy_memberships, crisp_assign, macrostates)
+    (fuzzy_memberships, crisp_assign, macrostates, reordered_a)
 }
 
-fn sq_dist(a: &[f64], b: &[f64]) -> f64 {
-    a.iter()
-        .zip(b.iter())
-        .map(|(x, y)| {
-            let d = x - y;
-            d * d
-        })
-        .sum()
+/// Enforces inner-simplex row-sum & non-negativity constraints on `a` (`M x M`) given `psi` (`K x M`)
+/// and returns the Röblitz–Weber crispness score `I(A) = sum_{c,r} A[r][c]^2 / A[0][c]`.
+fn fill_a_matrix(psi: &[Vec<f64>], a: &mut [Vec<f64>]) -> Option<f64> {
+    let m = a.len();
+    let k = psi.len();
+    if m < 2 || k == 0 {
+        return None;
+    }
+
+    // Enforce zero row-sum for modes r >= 1: A[r][m - 1] = -sum_{c=0}^{m-2} A[r][c]
+    for r in 1..m {
+        let mut s = 0.0f64;
+        for c in 0..(m - 1) {
+            if !a[r][c].is_finite() {
+                return None;
+            }
+            s += a[r][c];
+        }
+        a[r][m - 1] = -s;
+    }
+
+    // Set A[0][c] = -min_i sum_{r=1}^{m-1} psi[i][r] * A[r][c] so chi[i][c] >= 0 identically
+    let mut sum_a0 = 0.0f64;
+    for c in 0..m {
+        let mut min_g = f64::INFINITY;
+        for row in psi {
+            let mut g = 0.0f64;
+            for r in 1..m {
+                g += row[r] * a[r][c];
+            }
+            if g < min_g {
+                min_g = g;
+            }
+        }
+        let a0c = (-min_g).max(0.0);
+        a[0][c] = a0c;
+        sum_a0 += a0c;
+    }
+
+    if !sum_a0.is_finite() || sum_a0 <= 1.0e-12 {
+        return None;
+    }
+
+    let inv_s = 1.0 / sum_a0;
+    for r in 0..m {
+        for c in 0..m {
+            a[r][c] *= inv_s;
+        }
+    }
+
+    let mut crispness = 0.0f64;
+    for c in 0..m {
+        if a[0][c] <= 1.0e-14 {
+            return None;
+        }
+        let mut col_norm2 = 0.0f64;
+        for r in 0..m {
+            col_norm2 += a[r][c] * a[r][c];
+        }
+        crispness += col_norm2 / a[0][c];
+    }
+    if crispness.is_finite() {
+        Some(crispness)
+    } else {
+        None
+    }
+}
+
+fn invert_square_matrix(mat: &[Vec<f64>]) -> Option<Vec<Vec<f64>>> {
+    let n = mat.len();
+    if n == 0 || mat.iter().any(|r| r.len() != n) {
+        return None;
+    }
+    let mut aug = vec![vec![0.0f64; 2 * n]; n];
+    for r in 0..n {
+        for c in 0..n {
+            aug[r][c] = mat[r][c];
+        }
+        aug[r][n + r] = 1.0;
+    }
+
+    for col in 0..n {
+        let mut piv = col;
+        let mut max_abs = aug[col][col].abs();
+        for r in (col + 1)..n {
+            if aug[r][col].abs() > max_abs {
+                max_abs = aug[r][col].abs();
+                piv = r;
+            }
+        }
+        if max_abs < 1.0e-12 {
+            return None;
+        }
+        if piv != col {
+            aug.swap(col, piv);
+        }
+        let diag = aug[col][col];
+        for c in 0..(2 * n) {
+            aug[col][c] /= diag;
+        }
+        for r in 0..n {
+            if r == col {
+                continue;
+            }
+            let factor = aug[r][col];
+            if factor.abs() > 0.0 {
+                for c in 0..(2 * n) {
+                    aug[r][c] -= factor * aug[col][c];
+                }
+            }
+        }
+    }
+
+    Some(
+        aug.into_iter()
+            .map(|row| row[n..].to_vec())
+            .collect(),
+    )
 }
 
 #[cfg(test)]
@@ -728,5 +1165,184 @@ mod tests {
             }
         }
         assert!(min_fe.abs() < 1e-9);
+    }
+
+    fn synthetic_frame_for_state(
+        run: u32,
+        step: u32,
+        temp_k: f64,
+        pot: f64,
+        rg: f64,
+        rmsd: f64,
+    ) -> ConformationalFrame {
+        use fold_proto::WorkUnitId;
+        ConformationalFrame {
+            frame_idx: 0,
+            wu_id: WorkUnitId::new(1, run, 0, step),
+            chain_step: step,
+            checkpoint_blake3: [0u8; 32],
+            temperature_kelvin: temp_k,
+            potential_energy_kcal: pot,
+            rg_angstrom: rg,
+            sasa_angstrom2: 1200.0,
+            rmsd_to_seed_ang: rmsd,
+            rmsd_to_lowest_energy_ang: rmsd,
+            positions_angstrom: vec![[0.0, 0.0, 0.0]],
+        }
+    }
+
+    #[test]
+    fn tarjan_scc_prunes_transient_and_disconnected_microstates() {
+        // States {0,1,2} form a cyclic ergodic SCC; state 3 is transient (3->0 only); state 4 is isolated (4->4 only).
+        let seq = [3usize, 0, 1, 2, 0, 1, 2, 0, 2, 1, 0];
+        let mut frames = Vec::new();
+        let mut assignments = Vec::new();
+        for (step, &st) in seq.iter().enumerate() {
+            frames.push(synthetic_frame_for_state(
+                0,
+                step as u32,
+                300.0,
+                -100.0 + (st as f64) * 2.0,
+                8.0 + (st as f64),
+                st as f64,
+            ));
+            assignments.push(st);
+        }
+        // Isolated chain for state 4
+        frames.push(synthetic_frame_for_state(1, 0, 300.0, -80.0, 14.0, 4.0));
+        assignments.push(4);
+        frames.push(synthetic_frame_for_state(1, 1, 300.0, -80.0, 14.0, 4.0));
+        assignments.push(4);
+
+        let clustering = MicrostateClustering {
+            num_microstates: 5,
+            medoid_frame_indices: vec![1, 2, 3, 0, seq.len()],
+            frame_assignments: assignments,
+            frame_to_medoid_rmsd: vec![0.0; frames.len()],
+            microstate_counts: vec![4, 3, 3, 1, 2],
+            mean_cluster_radius_ang: vec![0.1; 5],
+        };
+
+        let msm = estimate_reversible_msm(&frames, &clustering, 1, 1.0, 300.0, 2)
+            .expect("Tarjan SCC MSM");
+        assert_eq!(msm.num_microstates, 3);
+        assert_eq!(msm.active_microstates, vec![0, 1, 2]);
+        assert_eq!(msm.pruned_microstates, vec![3, 4]);
+        assert_eq!(
+            msm.orig_to_active,
+            vec![Some(0), Some(1), Some(2), None, None]
+        );
+        let pi_sum: f64 = msm.stationary_pi.iter().sum();
+        assert!((pi_sum - 1.0).abs() < 1e-10);
+        assert!(msm.detailed_balance_max_error < 1e-10);
+    }
+
+    #[test]
+    fn cold_rung_filtering_excludes_hot_mremd_denatured_transitions() {
+        // Cold rung at 285 K visits states 0<->1 (4 transitions); hot rung at 400 K visits states 2<->3 (4 transitions).
+        let mut frames = Vec::new();
+        let mut assignments = Vec::new();
+        for (step, &st) in [0usize, 1, 0, 1, 0].iter().enumerate() {
+            frames.push(synthetic_frame_for_state(
+                0,
+                step as u32,
+                285.0,
+                -110.0 + (st as f64),
+                8.0 + (st as f64),
+                st as f64,
+            ));
+            assignments.push(st);
+        }
+        for (step, &st) in [2usize, 3, 2, 3, 2].iter().enumerate() {
+            frames.push(synthetic_frame_for_state(
+                1,
+                step as u32,
+                400.0,
+                -40.0 + (st as f64),
+                15.0 + (st as f64),
+                st as f64,
+            ));
+            assignments.push(st);
+        }
+
+        let clustering = MicrostateClustering {
+            num_microstates: 4,
+            medoid_frame_indices: vec![0, 1, 5, 6],
+            frame_assignments: assignments,
+            frame_to_medoid_rmsd: vec![0.0; frames.len()],
+            microstate_counts: vec![3, 2, 3, 2],
+            mean_cluster_radius_ang: vec![0.1; 4],
+        };
+
+        let msm = estimate_reversible_msm(&frames, &clustering, 1, 1.0, 300.0, 2)
+            .expect("cold-rung filtered MSM");
+        assert_eq!(msm.total_transitions, 4);
+        assert_eq!(msm.active_microstates, vec![0, 1]);
+        assert_eq!(msm.pruned_microstates, vec![2, 3]);
+    }
+
+    #[test]
+    fn roblitz_weber_pcca_satisfies_exact_subspace_chi_equals_psi_a() {
+        // 6-state 3-basin metastable chain: {0,1} <-> {2,3} <-> {4,5} with strong intra-basin coupling
+        let mut frames = Vec::new();
+        let mut assignments = Vec::new();
+        let mut seq = Vec::new();
+        for _ in 0..8 {
+            seq.extend_from_slice(&[0usize, 1, 0, 1, 0, 1, 2]);
+            seq.extend_from_slice(&[2, 3, 2, 3, 2, 3, 4]);
+            seq.extend_from_slice(&[4, 5, 4, 5, 4, 5, 2, 0]);
+        }
+        for (step, &st) in seq.iter().enumerate() {
+            frames.push(synthetic_frame_for_state(
+                0,
+                step as u32,
+                300.0,
+                -120.0 + (st as f64) * 3.0,
+                7.5 + (st as f64) * 1.2,
+                (st as f64) * 1.5,
+            ));
+            assignments.push(st);
+        }
+        let mut medoids = vec![0usize; 6];
+        let mut counts = vec![0usize; 6];
+        for (idx, &st) in assignments.iter().enumerate() {
+            if counts[st] == 0 {
+                medoids[st] = idx;
+            }
+            counts[st] += 1;
+        }
+        let clustering = MicrostateClustering {
+            num_microstates: 6,
+            medoid_frame_indices: medoids,
+            frame_assignments: assignments,
+            frame_to_medoid_rmsd: vec![0.0; frames.len()],
+            microstate_counts: counts,
+            mean_cluster_radius_ang: vec![0.1; 6],
+        };
+
+        let msm = estimate_reversible_msm(&frames, &clustering, 1, 1.0, 300.0, 3)
+            .expect("3-basin Röblitz-Weber PCCA+");
+        assert_eq!(msm.num_microstates, 6);
+        assert_eq!(msm.macrostates.len(), 3);
+        let m = 3usize;
+        assert_eq!(msm.pcca_transform_a.len(), m);
+
+        for i in 0..msm.num_microstates {
+            let mut row_sum = 0.0f64;
+            for a in 0..m {
+                let chi_ia = msm.fuzzy_memberships[i][a];
+                assert!(chi_ia >= -1e-12 && chi_ia <= 1.0 + 1e-12);
+                row_sum += chi_ia;
+                let mut psi_dot_a = 0.0f64;
+                for r in 0..m {
+                    psi_dot_a += msm.right_eigenvectors[r][i] * msm.pcca_transform_a[r][a];
+                }
+                assert!(
+                    (chi_ia - psi_dot_a).abs() < 1e-9,
+                    "chi != Psi * A at ({i}, {a}): {chi_ia} vs {psi_dot_a}"
+                );
+            }
+            assert!((row_sum - 1.0).abs() < 1e-9);
+        }
     }
 }
