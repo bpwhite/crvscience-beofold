@@ -45,6 +45,26 @@ enum WorkspaceTab {
     MsmFreeEnergyFlux,
 }
 
+pub(crate) fn classify_status_color(msg: &str, default_color: Color32) -> Color32 {
+    let lower = msg.to_ascii_lowercase();
+    if lower.contains("error") || lower.contains("failed") {
+        Color32::from_rgb(248, 113, 113)
+    } else if lower.contains("need >=") {
+        Color32::from_rgb(251, 191, 36)
+    } else {
+        default_color
+    }
+}
+
+pub(crate) fn non_empty_trimmed_path(raw: &str) -> Result<PathBuf, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        Err("Export error: output path cannot be empty.".to_string())
+    } else {
+        Ok(PathBuf::from(trimmed))
+    }
+}
+
 pub struct GuiLaunchConfig {
     pub lan_peer: String,
     pub cluster_secret: String,
@@ -440,7 +460,7 @@ impl BeoFoldGuiApp {
                             RichText::new(msg)
                                 .monospace()
                                 .size(10.5)
-                                .color(Color32::from_rgb(56, 189, 248)),
+                                .color(classify_status_color(msg, Color32::from_rgb(56, 189, 248))),
                         );
                     }
 
@@ -529,15 +549,17 @@ impl BeoFoldGuiApp {
                             }
                         }
                         if ui.button("Export").clicked() {
-                            let out = PathBuf::from(self.export_pdb_path.trim());
-                            match live.export_best_pdb(&out) {
-                                Ok(()) => {
-                                    self.last_export_msg =
-                                        Some(format!("Saved PDB to {}", out.display()));
-                                }
-                                Err(e) => {
-                                    self.last_export_msg = Some(format!("Export failed: {}", e));
-                                }
+                            match non_empty_trimmed_path(&self.export_pdb_path) {
+                                Ok(out) => match live.export_best_pdb(&out) {
+                                    Ok(()) => {
+                                        self.last_export_msg =
+                                            Some(format!("Saved PDB to {}", out.display()));
+                                    }
+                                    Err(e) => {
+                                        self.last_export_msg = Some(format!("Export failed: {}", e));
+                                    }
+                                },
+                                Err(msg) => self.last_export_msg = Some(msg),
                             }
                         }
                     });
@@ -546,7 +568,7 @@ impl BeoFoldGuiApp {
                             RichText::new(msg)
                                 .monospace()
                                 .size(11.0)
-                                .color(Color32::from_rgb(52, 211, 153)),
+                                .color(classify_status_color(msg, Color32::from_rgb(52, 211, 153))),
                         );
                     }
 
@@ -1277,6 +1299,12 @@ impl BeoFoldGuiApp {
     }
 
     pub fn render_ui(&mut self, ctx: &egui::Context) {
+        if self.show_about && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.show_about = false;
+        } else if !ctx.wants_keyboard_input() && ctx.input(|i| i.key_pressed(egui::Key::F1)) {
+            self.show_about = !self.show_about;
+        }
+
         let net_snap = self
             .net_state
             .lock()
@@ -1295,8 +1323,12 @@ impl BeoFoldGuiApp {
         egui::TopBottomPanel::bottom("beofold_status_footer").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("About").clicked() {
-                        self.show_about = true;
+                    if ui
+                        .button("About")
+                        .on_hover_text("About BeoFold & CRV Science Network (F1)")
+                        .clicked()
+                    {
+                        self.show_about = !self.show_about;
                     }
                     ui.separator();
                     ui.label(
@@ -1373,5 +1405,89 @@ impl eframe::App for BeoFoldGuiApp {
 impl Drop for BeoFoldGuiApp {
     fn drop(&mut self) {
         let _ = self.sandbox_tx.send(SandboxCommand::Shutdown);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_banner_color_classifies_error_amber_and_default() {
+        let default_ok = Color32::from_rgb(52, 211, 153);
+        let red = Color32::from_rgb(248, 113, 113);
+        let amber = Color32::from_rgb(251, 191, 36);
+
+        assert_eq!(
+            classify_status_color("Export error: output path cannot be empty.", default_ok),
+            red
+        );
+        assert_eq!(
+            classify_status_color("Export FAILED: permission denied", default_ok),
+            red
+        );
+        assert_eq!(
+            classify_status_color(
+                "Live studio currently has 4 conformations (need >= 8).",
+                default_ok
+            ),
+            amber
+        );
+        assert_eq!(
+            classify_status_color("Saved PDB to ./beofold_supervisor_best.pdb", default_ok),
+            default_ok
+        );
+        assert_eq!(
+            non_empty_trimmed_path("   "),
+            Err("Export error: output path cannot be empty.".to_string())
+        );
+        assert_eq!(
+            non_empty_trimmed_path("  ./out.pdb "),
+            Ok(PathBuf::from("./out.pdb"))
+        );
+    }
+
+    #[test]
+    fn f1_and_escape_toggle_about_modal_headlessly() {
+        let ctx = egui::Context::default();
+        let mut app = BeoFoldGuiApp::new_with_ctx(
+            &ctx,
+            GuiLaunchConfig {
+                lan_peer: String::new(),
+                cluster_secret: "test".to_string(),
+                sync_url: String::new(),
+                vault_dir: "./beofold_data".to_string(),
+                use_gpu: false,
+            },
+        );
+        assert!(!app.show_about);
+
+        let run_key = |app: &mut BeoFoldGuiApp, key: egui::Key| {
+            let mut raw = egui::RawInput::default();
+            raw.screen_rect = Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 800.0),
+            ));
+            raw.events.push(egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            });
+            let _ = ctx.run(raw, |c| app.render_ui(c));
+        };
+
+        run_key(&mut app, egui::Key::F1);
+        assert!(app.show_about, "F1 should open About modal");
+
+        run_key(&mut app, egui::Key::Escape);
+        assert!(!app.show_about, "Escape should dismiss About modal");
+
+        run_key(&mut app, egui::Key::F1);
+        assert!(app.show_about, "F1 should reopen About modal");
+
+        run_key(&mut app, egui::Key::F1);
+        assert!(!app.show_about, "Second F1 should toggle About modal closed");
     }
 }

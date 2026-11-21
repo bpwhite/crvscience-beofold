@@ -13,6 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://gnu.org>.
 
+use crate::app::{classify_status_color, non_empty_trimmed_path};
 use crate::live_sandbox::{LiveFoldingState, SandboxCommand};
 use crate::viewport3d::ConformationViewport;
 use egui::{
@@ -365,22 +366,39 @@ impl MsmLandscapeTab {
                     ui.add(
                         egui::Slider::new(&mut self.num_microstates, 4..=18)
                             .text("Microstates (K)"),
+                    )
+                    .on_hover_text(
+                        "Number of Kabsch C-alpha RMSD k-medoids conformational microstates (4..=18).",
                     );
+                    self.num_macrostates = self.num_macrostates.min(self.num_microstates);
+                    let max_macro = self.num_microstates.min(5).max(2);
                     ui.add(
-                        egui::Slider::new(&mut self.num_macrostates, 2..=5)
+                        egui::Slider::new(&mut self.num_macrostates, 2..=max_macro)
                             .text("PCCA+ Macrostates (M)"),
+                    )
+                    .on_hover_text(
+                        "Number of metastable PCCA+ macrostates coarse-grained from K microstates (M <= K).",
                     );
                     ui.add(
                         egui::Slider::new(&mut self.lag_generations, 1..=4)
                             .text("Lag (Generations)"),
+                    )
+                    .on_hover_text(
+                        "Markov transition lag time tau measured in MREMD checkpoint generations.",
                     );
                     ui.add(
                         egui::Slider::new(&mut self.ref_temp_kelvin, 275.0..=380.0)
                             .text("Ref Temp (K)"),
+                    )
+                    .on_hover_text(
+                        "Reference thermodynamic bath temperature (Kelvin) for Boltzmann PMF weighting.",
                     );
                     ui.checkbox(
                         &mut self.cold_rung_filter_only,
                         "Cold-Rung Filter (T <= T_ref + 25 K)",
+                    )
+                    .on_hover_text(
+                        "Restrict MSM estimation to replicas within T_ref + 25 K when >= 8 cold frames exist.",
                     );
 
                     ui.add_space(6.0);
@@ -443,6 +461,9 @@ impl MsmLandscapeTab {
                         ui.add(
                             egui::Slider::new(&mut self.min_flux_threshold, 0.001..=0.05)
                                 .text("Min Flux (pi_i * T_ij)"),
+                        )
+                        .on_hover_text(
+                            "Minimum equilibrium probability flux (pi_i * T_ij) required to draw a transition edge.",
                         );
                     }
 
@@ -506,25 +527,27 @@ impl MsmLandscapeTab {
                                 }
                             }
                             if ui.button("Export All").clicked() {
-                                let out = PathBuf::from(self.export_bundle_dir.trim());
-                                match export_msm_bundle(
-                                    &out,
-                                    &bundle_clone.manifest,
-                                    &bundle_clone.topology,
-                                    &bundle_clone.frames,
-                                    &bundle_clone.clustering,
-                                    &bundle_clone.msm,
-                                ) {
-                                    Ok(art) => {
-                                        self.status_note = Some(format!(
-                                            "Exported SVG, JSON, CSVs & {} macrostate PDBs to {}",
-                                            art.macrostate_pdb_paths.len(),
-                                            out.display()
-                                        ));
-                                    }
-                                    Err(e) => {
-                                        self.status_note = Some(format!("Export error: {}", e));
-                                    }
+                                match non_empty_trimmed_path(&self.export_bundle_dir) {
+                                    Ok(out) => match export_msm_bundle(
+                                        &out,
+                                        &bundle_clone.manifest,
+                                        &bundle_clone.topology,
+                                        &bundle_clone.frames,
+                                        &bundle_clone.clustering,
+                                        &bundle_clone.msm,
+                                    ) {
+                                        Ok(art) => {
+                                            self.status_note = Some(format!(
+                                                "Exported SVG, JSON, CSVs & {} macrostate PDBs to {}",
+                                                art.macrostate_pdb_paths.len(),
+                                                out.display()
+                                            ));
+                                        }
+                                        Err(e) => {
+                                            self.status_note = Some(format!("Export error: {}", e));
+                                        }
+                                    },
+                                    Err(msg) => self.status_note = Some(msg),
                                 }
                             }
                         });
@@ -536,7 +559,7 @@ impl MsmLandscapeTab {
                             RichText::new(note)
                                 .monospace()
                                 .size(11.0)
-                                .color(Color32::from_rgb(52, 211, 153)),
+                                .color(classify_status_color(note, Color32::from_rgb(52, 211, 153))),
                         );
                     }
                 });
@@ -1243,4 +1266,39 @@ fn build_msm_from_redb_vault(
         msm,
         pmf_grid,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::live_sandbox::TargetPreset;
+
+    #[test]
+    fn msm_tab_clamps_macrostates_to_microstates_headlessly() {
+        let ctx = egui::Context::default();
+        let mut tab = MsmLandscapeTab::default();
+        tab.num_microstates = 4;
+        tab.num_macrostates = 5;
+
+        let live = LiveFoldingState::new_preset(TargetPreset::TrpCage1L2Y, false);
+        let (tx, _rx) = mpsc::channel();
+        let mut vault_dir = String::from("./beofold_data");
+
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1280.0, 800.0),
+        ));
+        let _ = ctx.run(raw, |c| {
+            let _ = tab.render(c, &live, &mut vault_dir, &tx);
+        });
+
+        assert!(
+            tab.num_macrostates <= tab.num_microstates,
+            "Macrostates M ({}) must be clamped <= Microstates K ({})",
+            tab.num_macrostates,
+            tab.num_microstates
+        );
+        assert_eq!(tab.num_macrostates, 4);
+    }
 }
