@@ -23,18 +23,18 @@ pub mod sanity;
 pub mod topology;
 
 pub use forcefield::{
-    compute_sasa_angstrom2, evaluate_forces_and_energy, evaluate_forces_and_energy_with_gpu,
-    EnergyBreakdown,
+    compute_sasa_angstrom2, eef1_solvation_weight, evaluate_forces_and_energy,
+    evaluate_forces_and_energy_with_gpu, EnergyBreakdown, GB_EPSILON_IN, GB_EPSILON_OUT,
 };
 pub use gpu::{probe_gpu_adapter, GpuAdapterSummary, GpuComputeError, GpuForceEngine};
 pub use integrator::{
-    initialize_clone_checkpoint, minimize_steric_clashes, run_generation_chunk,
-    run_generation_chunk_with_gpu, GenerationSummary, LangevinConfig,
+    compute_kinetic_energy_kcal, initialize_clone_checkpoint, minimize_steric_clashes,
+    run_generation_chunk, run_generation_chunk_with_gpu, GenerationSummary, LangevinConfig,
 };
 pub use morton::{morton_encode_3d, SpatialNeighborGrid};
 pub use mremd::{
     benchmark_local_node, benchmark_local_node_with_gpu, metropolis_swap_probability,
-    try_mremd_swap,
+    rescale_velocities_sugita_okamoto, try_mremd_swap, try_mremd_swap_checkpoints,
 };
 pub use rng::ChaCha8Rng;
 pub use sanity::{

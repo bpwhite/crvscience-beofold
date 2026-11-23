@@ -14,14 +14,14 @@
 // along with this program.  If not, see <https://gnu.org>.
 
 // BeoFold Cross-Vendor WGSL Non-Bonded Force & Energy Compute Kernel
-// Evaluates C1 force-shifted 12-6 Lennard-Jones + Generalized-Born distance-screened Coulomb
-// + Lazaridis-Karplus EEF1 smooth Gaussian hydrophobic solvation using 64-thread shared-memory tiles.
+// Evaluates C1 force-shifted 12-6 Lennard-Jones + Still Generalized-Born screened Coulomb
+// + Lazaridis-Karplus EEF1 signed Gaussian solvation using 64-thread shared-memory tiles.
 
 struct GpuUniforms {
     atom_count: u32,
     cutoff_ang: f32,
-    coulomb_quarter: f32,
-    _pad: u32,
+    coulomb_const: f32,
+    inv_eps_out: f32,
 }
 
 struct GpuAtomParams {
@@ -31,8 +31,8 @@ struct GpuAtomParams {
     flags: u32,        // bit 0: is_backbone (1u = backbone, 0u = sidechain)
     excl_offset: u32,  // CSR start index in `csr_exclusions`
     excl_count: u32,   // CSR entry count for this atom
-    _pad0: u32,
-    _pad1: u32,
+    gb_radius_ang: f32,
+    solv_weight: f32,
 }
 
 struct GpuAtomOutput {
@@ -55,6 +55,24 @@ struct GpuAtomOutput {
 var<workgroup> tile_pos: array<vec4<f32>, 64>;
 // tile_meta: x = sigma, y = epsilon, z = charge, w = f32(flags)
 var<workgroup> tile_meta: array<vec4<f32>, 64>;
+// tile_solv: x = gb_radius_ang, y = solv_weight
+var<workgroup> tile_solv: array<vec4<f32>, 64>;
+
+// Still (1990) Generalized-Born pairwise potential factor `g(r)` and derivative `dg/dr`
+// in cancellation-free algebraic form: vec2(g(r), dg_dr(r)).
+fn still_gb_pair_u_and_du(r: f32, a: f32, inv_eps_out: f32) -> vec2<f32> {
+    let r2 = r * r;
+    let exp_arg = exp(-r2 / (4.0 * a));
+    let h = a * exp_arg;
+    let f = sqrt(r2 + h);
+    let f2 = f * f;
+    let f3 = f2 * f;
+
+    let u = inv_eps_out / f + h / (r * f * (f + r));
+    let term_out = inv_eps_out * (r * (1.0 - 0.25 * exp_arg)) / f3;
+    let term_in = (h * (f2 + f * r + r2)) / (r2 * f3 * (f + r)) + (r * exp_arg) / (4.0 * f3);
+    return vec2<f32>(u, -(term_out + term_in));
+}
 
 // Looks up covalent exclusion policy for sorted CSR row `[offset .. offset + count)`:
 // Returns 0u = Full (1.0 LJ, 1.0 Elec), 1u = Excluded (1-2 / 1-3), 2u = Scaled14 (0.5 LJ, 1/1.2 Elec).
@@ -96,6 +114,8 @@ fn main(
     var flags_i: u32 = 0u;
     var excl_off: u32 = 0u;
     var excl_cnt: u32 = 0u;
+    var gb_rad_i: f32 = 1.5;
+    var solv_i: f32 = 0.0;
 
     if (valid_i) {
         pos_i = positions[i].xyz;
@@ -106,11 +126,13 @@ fn main(
         flags_i = p.flags;
         excl_off = p.excl_offset;
         excl_cnt = p.excl_count;
+        gb_rad_i = max(p.gb_radius_ang, 0.5);
+        solv_i = p.solv_weight;
     }
 
     let rc = uniforms.cutoff_ang;
     let rc2 = rc * rc;
-    let rc3 = rc2 * rc;
+    let inv_eps_out = uniforms.inv_eps_out;
 
     var fi = vec3<f32>(0.0, 0.0, 0.0);
     var e_lj_acc: f32 = 0.0;
@@ -131,9 +153,16 @@ fn main(
                 tp.charge_e,
                 f32(tp.flags),
             );
+            tile_solv[lid] = vec4<f32>(
+                max(tp.gb_radius_ang, 0.5),
+                tp.solv_weight,
+                0.0,
+                0.0,
+            );
         } else {
             tile_pos[lid] = vec4<f32>(0.0, 0.0, 0.0, 0.0);
             tile_meta[lid] = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+            tile_solv[lid] = vec4<f32>(1.5, 0.0, 0.0, 0.0);
         }
 
         workgroupBarrier();
@@ -166,13 +195,17 @@ fn main(
 
                 let r = sqrt(r2);
                 let meta_j = tile_meta[k];
+                let solv_meta_j = tile_solv[k];
                 let sigma_j = meta_j.x;
                 let eps_j = meta_j.y;
                 let q_j = meta_j.z;
                 let flags_j = u32(meta_j.w + 0.5);
+                let gb_rad_j = solv_meta_j.x;
+                let solv_j = solv_meta_j.y;
 
                 let sigma = 0.5 * (sigma_i + sigma_j);
-                let eps = lj_scale * sqrt(eps_i * eps_j);
+                let eps_pair = sqrt(eps_i * eps_j);
+                let eps = lj_scale * eps_pair;
 
                 var du_dr_total: f32 = 0.0;
 
@@ -199,37 +232,62 @@ fn main(
                     }
                 }
 
-                // 2. Implicit-solvent distance-screened Coulomb (eps_eff(r) = 4.0 * r)
+                // 2. Still Generalized-Born screened electrostatics with effective Born radii
                 let q_prod = q_i * q_j;
                 if (abs(q_prod) > 1.0e-7) {
-                    let k_q = elec_scale * uniforms.coulomb_quarter * q_prod;
-                    let u_el = k_q / r2;
-                    let uc_el = k_q / rc2;
-                    let du_el = -2.0 * k_q / (r2 * r);
-                    let duc_el = -2.0 * k_q / rc3;
+                    let a_gb = gb_rad_i * gb_rad_j;
+                    let k_q = elec_scale * uniforms.coulomb_const * q_prod;
+                    let gb_r = still_gb_pair_u_and_du(r, a_gb, inv_eps_out);
+                    let gb_rc = still_gb_pair_u_and_du(rc, a_gb, inv_eps_out);
 
-                    du_dr_total = du_dr_total + (du_el - duc_el);
+                    du_dr_total = du_dr_total + k_q * (gb_r.y - gb_rc.y);
                     if (i < j) {
-                        e_elec_acc = e_elec_acc + (u_el - uc_el - (r - rc) * duc_el);
+                        e_elec_acc = e_elec_acc + k_q * (gb_r.x - gb_rc.x - (r - rc) * gb_rc.y);
                     }
                 }
 
-                // 3. EEF1 Lazaridis-Karplus smooth Gaussian hydrophobic burial between non-backbone sidechains
+                // 3. EEF1 Lazaridis-Karplus signed Gaussian solvation
                 if ((flags_i & 1u) == 0u && (flags_j & 1u) == 0u && policy == 0u) {
-                    let r_contact = 0.5 * (sigma_i + sigma_j) + 1.4;
-                    let width: f32 = 1.85;
-                    let well = 0.28 * sqrt(eps_i * eps_j);
-                    let z = (r - r_contact) / width;
-                    let z_cut = (rc - r_contact) / width;
+                    let s_avg = 0.5 * (solv_i + solv_j);
+                    if (s_avg > 1.0e-6) {
+                        let r_contact = sigma + 1.4;
+                        let width: f32 = 1.85;
+                        let well = 0.28 * eps_pair * s_avg;
+                        let z = (r - r_contact) / width;
+                        let z_cut = (rc - r_contact) / width;
 
-                    let u_g = -well * exp(-z * z);
-                    let uc_g = -well * exp(-z_cut * z_cut);
-                    let du_g = -u_g * (2.0 * z / width);
-                    let duc_g = -uc_g * (2.0 * z_cut / width);
+                        let u_g = -well * exp(-z * z);
+                        let uc_g = -well * exp(-z_cut * z_cut);
+                        let du_g = -u_g * (2.0 * z / width);
+                        let duc_g = -uc_g * (2.0 * z_cut / width);
 
-                    du_dr_total = du_dr_total + (du_g - duc_g);
-                    if (i < j) {
-                        e_solv_acc = e_solv_acc + (u_g - uc_g - (r - rc) * duc_g);
+                        du_dr_total = du_dr_total + (du_g - duc_g);
+                        if (i < j) {
+                            e_solv_acc = e_solv_acc + (u_g - uc_g - (r - rc) * duc_g);
+                        }
+                    } else if (s_avg < -1.0e-6) {
+                        let width: f32 = 2.20;
+                        let penalty = 0.28 * max(eps_pair, 0.28) * (-s_avg);
+                        let dr_pos = max(r - sigma, 0.0);
+                        let dr_cut = max(rc - sigma, 0.0);
+                        let z = dr_pos / width;
+                        let z_cut = dr_cut / width;
+
+                        let u_g = penalty * exp(-z * z);
+                        let uc_g = penalty * exp(-z_cut * z_cut);
+                        var du_g: f32 = 0.0;
+                        if (r > sigma) {
+                            du_g = -u_g * (2.0 * z / width);
+                        }
+                        var duc_g: f32 = 0.0;
+                        if (rc > sigma) {
+                            duc_g = -uc_g * (2.0 * z_cut / width);
+                        }
+
+                        du_dr_total = du_dr_total + (du_g - duc_g);
+                        if (i < j) {
+                            e_solv_acc = e_solv_acc + (u_g - uc_g - (r - rc) * duc_g);
+                        }
                     }
                 }
 

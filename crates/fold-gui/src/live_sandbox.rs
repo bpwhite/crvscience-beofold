@@ -17,10 +17,10 @@ use fold_msm::ConformationalFrame;
 use fold_physics::{
     compute_ca_rmsd, fraction_native_contacts, initialize_clone_checkpoint,
     minimize_steric_clashes, native_ca_contact_pairs, probe_gpu_adapter,
-    run_generation_chunk_with_gpu, try_mremd_swap, ChaCha8Rng, GpuAdapterSummary, GpuForceEngine,
-    LangevinConfig, ProteinTopology,
+    run_generation_chunk_with_gpu, try_mremd_swap_checkpoints, ChaCha8Rng, GpuAdapterSummary,
+    GpuForceEngine, LangevinConfig, ProteinTopology,
 };
-use fold_proto::{MremdEndpoint, TrajectoryCheckpoint, WorkUnitId};
+use fold_proto::{TrajectoryCheckpoint, WorkUnitId};
 use fold_storage::FoldStore;
 use rayon::prelude::*;
 use std::collections::VecDeque;
@@ -643,25 +643,9 @@ impl WorkerSimState {
 
         let mut k = start_pair;
         while k + 1 < self.checkpoints.len() {
-            let ep_a = MremdEndpoint {
-                wu_id: self.checkpoints[k].wu_id,
-                rung_index: k as u32,
-                temperature_kelvin: self.checkpoints[k].temperature_kelvin,
-                potential_energy_kcal: self.checkpoints[k].potential_energy_kcal,
-                output_checkpoint_blake3: [0u8; 32],
-            };
-            let ep_b = MremdEndpoint {
-                wu_id: self.checkpoints[k + 1].wu_id,
-                rung_index: (k + 1) as u32,
-                temperature_kelvin: self.checkpoints[k + 1].temperature_kelvin,
-                potential_energy_kcal: self.checkpoints[k + 1].potential_energy_kcal,
-                output_checkpoint_blake3: [0u8; 32],
-            };
-            let (accepted, new_ta, new_tb) = try_mremd_swap(&ep_a, &ep_b, &mut self.swap_rng);
-            if accepted {
-                self.checkpoints[k].temperature_kelvin = new_ta;
-                self.checkpoints[k + 1].temperature_kelvin = new_tb;
-            }
+            let (left, right) = self.checkpoints.split_at_mut(k + 1);
+            let accepted =
+                try_mremd_swap_checkpoints(&mut left[k], &mut right[0], &mut self.swap_rng);
             swap_updates.push((k, accepted));
             k += 2;
         }

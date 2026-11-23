@@ -65,6 +65,19 @@ pub(crate) fn non_empty_trimmed_path(raw: &str) -> Result<PathBuf, String> {
     }
 }
 
+pub(crate) fn validate_lan_peer_input(raw: &str) -> Result<Option<SocketAddr>, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    trimmed.parse::<SocketAddr>().map(Some).map_err(|_| {
+        format!(
+            "Invalid socket address '{}' (expected IP:port, e.g. 127.0.0.1:7443)",
+            trimmed
+        )
+    })
+}
+
 pub struct GuiLaunchConfig {
     pub lan_peer: String,
     pub cluster_secret: String,
@@ -77,7 +90,9 @@ pub struct BeoFoldGuiApp {
     active_tab: WorkspaceTab,
 
     // Connection bar editable fields
+    cluster_bar_open: bool,
     lan_peer_input: String,
+    lan_peer_error: Option<String>,
     cluster_secret_input: String,
     wan_sync_url_input: String,
     vault_dir_input: String,
@@ -114,8 +129,13 @@ impl BeoFoldGuiApp {
         visuals.window_fill = Color32::from_rgb(18, 24, 34);
         ctx.set_visuals(visuals);
 
+        let (initial_peer_opt, initial_peer_err) = match validate_lan_peer_input(&cfg.lan_peer) {
+            Ok(opt) => (opt, None),
+            Err(err) => (None, Some(err)),
+        };
+
         let initial_targets = PollerTargets {
-            lan_peer: cfg.lan_peer.trim().parse::<SocketAddr>().ok(),
+            lan_peer: initial_peer_opt,
             cluster_secret: cfg.cluster_secret.clone(),
             wan_sync_url: if cfg.sync_url.trim().is_empty() {
                 None
@@ -141,7 +161,9 @@ impl BeoFoldGuiApp {
 
         Self {
             active_tab: WorkspaceTab::FoldingStudio3D,
+            cluster_bar_open: initial_peer_err.is_some(),
             lan_peer_input: cfg.lan_peer,
+            lan_peer_error: initial_peer_err,
             cluster_secret_input: cfg.cluster_secret,
             wan_sync_url_input: cfg.sync_url,
             vault_dir_input: cfg.vault_dir,
@@ -164,8 +186,17 @@ impl BeoFoldGuiApp {
         }
     }
 
-    fn apply_network_targets(&self) {
-        let parsed_peer = self.lan_peer_input.trim().parse::<SocketAddr>().ok();
+    fn apply_network_targets(&mut self) {
+        let parsed_peer = match validate_lan_peer_input(&self.lan_peer_input) {
+            Ok(opt) => {
+                self.lan_peer_error = None;
+                opt
+            }
+            Err(err) => {
+                self.lan_peer_error = Some(err);
+                None
+            }
+        };
         let wan_opt = if self.wan_sync_url_input.trim().is_empty() {
             None
         } else {
@@ -192,7 +223,8 @@ impl BeoFoldGuiApp {
                 &mut self.active_tab,
                 WorkspaceTab::FoldingStudio3D,
                 "3D Conformation & MREMD Studio",
-            );
+            )
+            .on_hover_text("Tab 1 (Hotkey: 1)");
             ui.selectable_value(
                 &mut self.active_tab,
                 WorkspaceTab::LanBeowulfMatrix,
@@ -203,7 +235,8 @@ impl BeoFoldGuiApp {
                         .map(|s| s.peers.len())
                         .unwrap_or(0)
                 ),
-            );
+            )
+            .on_hover_text("Tab 2 (Hotkey: 2)");
             ui.selectable_value(
                 &mut self.active_tab,
                 WorkspaceTab::GlobalWanFederation,
@@ -214,12 +247,14 @@ impl BeoFoldGuiApp {
                         .map(|w| w.clusters.len())
                         .unwrap_or(0)
                 ),
-            );
+            )
+            .on_hover_text("Tab 3 (Hotkey: 3)");
             ui.selectable_value(
                 &mut self.active_tab,
                 WorkspaceTab::MsmFreeEnergyFlux,
                 "MSM Free-Energy & Flux",
-            );
+            )
+            .on_hover_text("Tab 4 (Hotkey: 4)");
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let wan_badge = if net.wan_connected {
@@ -241,79 +276,134 @@ impl BeoFoldGuiApp {
             });
         });
 
-        ui.add_space(4.0);
+        ui.add_space(3.0);
         ui.horizontal(|ui| {
-            ui.label(RichText::new("LAN Peer:").monospace().size(11.5));
-            ui.add(egui::TextEdit::singleline(&mut self.lan_peer_input).desired_width(135.0));
-
-            ui.label(RichText::new("Secret:").monospace().size(11.5));
-            ui.add(
-                egui::TextEdit::singleline(&mut self.cluster_secret_input)
-                    .password(true)
-                    .desired_width(110.0),
-            );
-
-            ui.label(RichText::new("Apache Sync URL:").monospace().size(11.5));
-            ui.add(egui::TextEdit::singleline(&mut self.wan_sync_url_input).desired_width(240.0));
-
-            if ui.button("Connect / Refresh").clicked() {
-                self.apply_network_targets();
-            }
-            let scan_label = if net.lan_discovery_scanning {
-                "Scanning LAN..."
-            } else {
-                "Discover LAN"
-            };
+            let arrow = if self.cluster_bar_open { "▾" } else { "▸" };
             if ui
-                .add_enabled(!net.lan_discovery_scanning, egui::Button::new(scan_label))
-                .on_hover_text(
-                    "Browse _beofold._udp.local. (mDNS) and localhost 7443..7446 for Beowulf cluster nodes.",
-                )
+                .button(RichText::new(format!("{arrow} Cluster Connection")).strong().size(11.5))
+                .on_hover_text("Expand/collapse LAN QUIC peer, cluster secret, and Apache WAN sync configuration.")
                 .clicked()
             {
-                spawn_one_click_mdns_scan(
-                    self.cluster_secret_input.clone(),
-                    self.wan_sync_url_input.clone(),
-                    self.net_state.clone(),
-                    self.net_targets_tx.clone(),
-                    true,
+                self.cluster_bar_open = !self.cluster_bar_open;
+            }
+
+            if let Some(ref err) = self.lan_peer_error {
+                ui.label(
+                    RichText::new(format!("⚠ {}", err))
+                        .monospace()
+                        .size(11.0)
+                        .color(Color32::from_rgb(248, 113, 113)),
+                );
+            } else {
+                let peer_disp = if self.lan_peer_input.trim().is_empty() {
+                    "none"
+                } else {
+                    self.lan_peer_input.trim()
+                };
+                let wan_disp = if self.wan_sync_url_input.trim().is_empty() {
+                    "WAN: off"
+                } else {
+                    self.wan_sync_url_input.trim()
+                };
+                ui.label(
+                    RichText::new(format!("Peer: {} | {}", peer_disp, wan_disp))
+                        .monospace()
+                        .size(11.0)
+                        .color(Color32::from_rgb(148, 163, 184)),
                 );
             }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    RichText::new("Hotkeys: Space Play/Pause | R Reset Cam | S Spin | 1-4 Tabs | F1 About")
+                        .monospace()
+                        .size(10.0)
+                        .color(Color32::from_rgb(120, 136, 158)),
+                );
+            });
         });
 
-        if !net.discovered_lan_peers.is_empty() || net.lan_discovery_status.is_some() {
+        if self.cluster_bar_open {
+            ui.add_space(3.0);
             ui.horizontal_wrapped(|ui| {
-                if let Some(ref st) = net.lan_discovery_status {
-                    ui.label(
-                        RichText::new(st)
-                            .monospace()
-                            .size(10.5)
-                            .color(Color32::from_rgb(148, 163, 184)),
-                    );
+                ui.label(RichText::new("LAN Peer:").monospace().size(11.5));
+                let mut peer_edit = egui::TextEdit::singleline(&mut self.lan_peer_input).desired_width(145.0);
+                if self.lan_peer_error.is_some() {
+                    peer_edit = peer_edit.text_color(Color32::from_rgb(248, 113, 113));
                 }
-                let mut picked_peer: Option<String> = None;
-                for peer in &net.discovered_lan_peers {
-                    let chip_col = if peer.matches_secret {
-                        Color32::from_rgb(52, 211, 153)
-                    } else {
-                        Color32::from_rgb(251, 191, 36)
-                    };
-                    let chip_text = format!(
-                        "{} [Tier {} | {}c]",
-                        peer.addr, peer.tier, peer.cores
-                    );
-                    if ui
-                        .small_button(RichText::new(chip_text).monospace().color(chip_col))
-                        .clicked()
-                    {
-                        picked_peer = Some(peer.addr.to_string());
-                    }
+                if ui.add(peer_edit).changed() {
+                    self.lan_peer_error = validate_lan_peer_input(&self.lan_peer_input).err();
                 }
-                if let Some(addr_str) = picked_peer {
-                    self.lan_peer_input = addr_str;
+
+                ui.label(RichText::new("Secret:").monospace().size(11.5));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.cluster_secret_input)
+                        .password(true)
+                        .desired_width(110.0),
+                );
+
+                ui.label(RichText::new("Apache Sync URL:").monospace().size(11.5));
+                ui.add(egui::TextEdit::singleline(&mut self.wan_sync_url_input).desired_width(240.0));
+
+                if ui.button("Connect / Refresh").clicked() {
                     self.apply_network_targets();
                 }
+                let scan_label = if net.lan_discovery_scanning {
+                    "Scanning LAN..."
+                } else {
+                    "Discover LAN"
+                };
+                if ui
+                    .add_enabled(!net.lan_discovery_scanning, egui::Button::new(scan_label))
+                    .on_hover_text(
+                        "Browse _beofold._udp.local. (mDNS) and localhost 7443..7446 for Beowulf cluster nodes.",
+                    )
+                    .clicked()
+                {
+                    spawn_one_click_mdns_scan(
+                        self.cluster_secret_input.clone(),
+                        self.wan_sync_url_input.clone(),
+                        self.net_state.clone(),
+                        self.net_targets_tx.clone(),
+                        true,
+                    );
+                }
             });
+
+            if !net.discovered_lan_peers.is_empty() || net.lan_discovery_status.is_some() {
+                ui.horizontal_wrapped(|ui| {
+                    if let Some(ref st) = net.lan_discovery_status {
+                        ui.label(
+                            RichText::new(st)
+                                .monospace()
+                                .size(10.5)
+                                .color(Color32::from_rgb(148, 163, 184)),
+                        );
+                    }
+                    let mut picked_peer: Option<String> = None;
+                    for peer in &net.discovered_lan_peers {
+                        let chip_col = if peer.matches_secret {
+                            Color32::from_rgb(52, 211, 153)
+                        } else {
+                            Color32::from_rgb(251, 191, 36)
+                        };
+                        let chip_text = format!(
+                            "{} [Tier {} | {}c]",
+                            peer.addr, peer.tier, peer.cores
+                        );
+                        if ui
+                            .small_button(RichText::new(chip_text).monospace().color(chip_col))
+                            .clicked()
+                        {
+                            picked_peer = Some(peer.addr.to_string());
+                        }
+                    }
+                    if let Some(addr_str) = picked_peer {
+                        self.lan_peer_input = addr_str;
+                        self.apply_network_targets();
+                    }
+                });
+            }
         }
     }
 
@@ -338,7 +428,11 @@ impl BeoFoldGuiApp {
                         } else {
                             "Start Live MREMD"
                         };
-                        if ui.button(RichText::new(btn_label).strong()).clicked() {
+                        if ui
+                            .button(RichText::new(btn_label).strong())
+                            .on_hover_text("Start or pause live local 4-rung MREMD folding (Space)")
+                            .clicked()
+                        {
                             let _ = self
                                 .sandbox_tx
                                 .send(SandboxCommand::SetRunning(!live.running));
@@ -504,12 +598,17 @@ impl BeoFoldGuiApp {
                         });
 
                     ui.horizontal(|ui| {
-                        ui.checkbox(&mut self.viewport.auto_spin, "Auto-Spin");
+                        ui.checkbox(&mut self.viewport.auto_spin, "Auto-Spin")
+                            .on_hover_text("Toggle 3D conformation rotation (S)");
                         ui.checkbox(
                             &mut self.viewport.show_best_conformation,
                             "Lock Lowest-E Fold",
                         );
-                        if ui.button("Reset Cam").clicked() {
+                        if ui
+                            .button("Reset Cam")
+                            .on_hover_text("Reset camera yaw, pitch, zoom, and pan (R)")
+                            .clicked()
+                        {
                             self.viewport.reset_camera();
                         }
                     });
@@ -1299,10 +1398,62 @@ impl BeoFoldGuiApp {
     }
 
     pub fn render_ui(&mut self, ctx: &egui::Context) {
+        let mut live_snap = self
+            .live_state
+            .lock()
+            .expect("live folding state mutex poisoned")
+            .clone();
+
         if self.show_about && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.show_about = false;
-        } else if !ctx.wants_keyboard_input() && ctx.input(|i| i.key_pressed(egui::Key::F1)) {
-            self.show_about = !self.show_about;
+        } else if !ctx.wants_keyboard_input() {
+            let (f1, space, r_key, s_key, k1, k2, k3, k4) = ctx.input(|i| {
+                let no_mod =
+                    !i.modifiers.ctrl && !i.modifiers.alt && !i.modifiers.command && !i.modifiers.mac_cmd;
+                (
+                    i.key_pressed(egui::Key::F1),
+                    no_mod && i.key_pressed(egui::Key::Space),
+                    no_mod && i.key_pressed(egui::Key::R),
+                    no_mod && i.key_pressed(egui::Key::S),
+                    no_mod && i.key_pressed(egui::Key::Num1),
+                    no_mod && i.key_pressed(egui::Key::Num2),
+                    no_mod && i.key_pressed(egui::Key::Num3),
+                    no_mod && i.key_pressed(egui::Key::Num4),
+                )
+            });
+            if f1 {
+                self.show_about = !self.show_about;
+            }
+            if space {
+                let next_running = !live_snap.running;
+                live_snap.running = next_running;
+                if let Ok(mut g) = self.live_state.lock() {
+                    g.running = next_running;
+                }
+                let _ = self
+                    .sandbox_tx
+                    .send(SandboxCommand::SetRunning(next_running));
+            }
+            if r_key {
+                self.viewport.reset_camera();
+                self.msm_tab.reset_preview_camera();
+            }
+            if s_key {
+                if self.active_tab == WorkspaceTab::MsmFreeEnergyFlux {
+                    self.msm_tab.toggle_preview_auto_spin();
+                } else {
+                    self.viewport.auto_spin = !self.viewport.auto_spin;
+                }
+            }
+            if k1 {
+                self.active_tab = WorkspaceTab::FoldingStudio3D;
+            } else if k2 {
+                self.active_tab = WorkspaceTab::LanBeowulfMatrix;
+            } else if k3 {
+                self.active_tab = WorkspaceTab::GlobalWanFederation;
+            } else if k4 {
+                self.active_tab = WorkspaceTab::MsmFreeEnergyFlux;
+            }
         }
 
         let net_snap = self
@@ -1310,11 +1461,6 @@ impl BeoFoldGuiApp {
             .lock()
             .map(|g| g.clone())
             .unwrap_or_default();
-        let live_snap = self
-            .live_state
-            .lock()
-            .expect("live folding state mutex poisoned")
-            .clone();
 
         egui::TopBottomPanel::top("beofold_top_bar").show(ctx, |ui| {
             self.render_top_bar(ui, &net_snap);
@@ -1489,5 +1635,139 @@ mod tests {
 
         run_key(&mut app, egui::Key::F1);
         assert!(!app.show_about, "Second F1 should toggle About modal closed");
+    }
+
+    #[test]
+    fn cluster_connection_bar_validates_socket_addr_and_shows_inline_error() {
+        assert_eq!(validate_lan_peer_input(""), Ok(None));
+        assert_eq!(validate_lan_peer_input("   "), Ok(None));
+        assert!(validate_lan_peer_input("127.0.0.1:7443").unwrap().is_some());
+        assert!(validate_lan_peer_input("not-an-address").is_err());
+        assert!(validate_lan_peer_input("192.168.1.5").is_err());
+        assert!(validate_lan_peer_input("127.0.0.1:99999").is_err());
+
+        let ctx = egui::Context::default();
+        let mut app = BeoFoldGuiApp::new_with_ctx(
+            &ctx,
+            GuiLaunchConfig {
+                lan_peer: "bad-socket".to_string(),
+                cluster_secret: "test".to_string(),
+                sync_url: String::new(),
+                vault_dir: "./beofold_data".to_string(),
+                use_gpu: false,
+            },
+        );
+        assert!(app.lan_peer_error.is_some());
+        assert!(app.cluster_bar_open, "Invalid initial peer opens connection bar");
+
+        app.lan_peer_input = "127.0.0.1:7443".to_string();
+        app.apply_network_targets();
+        assert!(app.lan_peer_error.is_none());
+    }
+
+    #[test]
+    fn global_hotkeys_switch_tabs_control_viewport_and_respect_keyboard_focus() {
+        let ctx = egui::Context::default();
+        let mut app = BeoFoldGuiApp::new_with_ctx(
+            &ctx,
+            GuiLaunchConfig {
+                lan_peer: "127.0.0.1:7443".to_string(),
+                cluster_secret: "test".to_string(),
+                sync_url: String::new(),
+                vault_dir: "./beofold_data".to_string(),
+                use_gpu: false,
+            },
+        );
+
+        let run_key = |app: &mut BeoFoldGuiApp, key: egui::Key| {
+            let mut raw = egui::RawInput::default();
+            raw.screen_rect = Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 800.0),
+            ));
+            raw.events.push(egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            });
+            let _ = ctx.run(raw, |c| app.render_ui(c));
+        };
+
+        assert_eq!(app.active_tab, WorkspaceTab::FoldingStudio3D);
+        assert!(!app.cluster_bar_open, "Cluster connection bar defaults collapsed");
+
+        // Tab switching hotkeys 1-4
+        run_key(&mut app, egui::Key::Num2);
+        assert_eq!(app.active_tab, WorkspaceTab::LanBeowulfMatrix);
+        run_key(&mut app, egui::Key::Num3);
+        assert_eq!(app.active_tab, WorkspaceTab::GlobalWanFederation);
+        run_key(&mut app, egui::Key::Num4);
+        assert_eq!(app.active_tab, WorkspaceTab::MsmFreeEnergyFlux);
+        run_key(&mut app, egui::Key::Num1);
+        assert_eq!(app.active_tab, WorkspaceTab::FoldingStudio3D);
+
+        // S toggles auto-spin; R resets camera
+        let spin_before = app.viewport.auto_spin;
+        run_key(&mut app, egui::Key::S);
+        assert_eq!(app.viewport.auto_spin, !spin_before);
+
+        app.viewport.yaw_rad = 2.1;
+        app.viewport.zoom = 2.4;
+        run_key(&mut app, egui::Key::R);
+        assert!((app.viewport.yaw_rad - 0.55).abs() < 1e-4);
+        assert!((app.viewport.zoom - 1.15).abs() < 1e-4);
+
+        // Space toggles live folding play/pause
+        assert!(!app.live_state.lock().unwrap().running);
+        run_key(&mut app, egui::Key::Space);
+        assert!(app.live_state.lock().unwrap().running);
+        run_key(&mut app, egui::Key::Space);
+        assert!(!app.live_state.lock().unwrap().running);
+
+        // Keyboard focus guard: when a TextEdit wants keyboard input, hotkeys must NOT fire
+        let mut focus_buf = String::from("127.0.0.1:7443");
+        let mut raw_focus = egui::RawInput::default();
+        raw_focus.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1280.0, 800.0),
+        ));
+        let _ = ctx.run(raw_focus, |c| {
+            egui::Window::new("focus_probe").show(c, |ui| {
+                let resp = ui.text_edit_singleline(&mut focus_buf);
+                resp.request_focus();
+            });
+        });
+        assert!(ctx.wants_keyboard_input());
+
+        let mut raw_blocked = egui::RawInput::default();
+        raw_blocked.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1280.0, 800.0),
+        ));
+        raw_blocked.events.push(egui::Event::Key {
+            key: egui::Key::Num4,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        raw_blocked.events.push(egui::Event::Key {
+            key: egui::Key::Space,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let _ = ctx.run(raw_blocked, |c| {
+            egui::Window::new("focus_probe").show(c, |ui| {
+                let resp = ui.text_edit_singleline(&mut focus_buf);
+                resp.request_focus();
+            });
+            app.render_ui(c);
+        });
+        assert_eq!(app.active_tab, WorkspaceTab::FoldingStudio3D);
+        assert!(!app.live_state.lock().unwrap().running);
     }
 }

@@ -48,7 +48,7 @@ pub fn export_msm_bundle(
     write_microstate_csv(&micro_csv, frames, clustering, msm)?;
 
     let pmf_csv = out_dir.join("free_energy_surface_2d.csv");
-    let grid = compute_2d_pmf_grid(frames, clustering, msm, 24, 24);
+    let grid = compute_2d_pmf_grid(frames, clustering, msm, 40, 40);
     write_pmf_grid_csv(&pmf_csv, &grid)?;
 
     let svg_path = out_dir.join("free_energy_landscape.svg");
@@ -98,11 +98,81 @@ pub struct PmfGrid2D {
     /// `values[ix][iy]` in `kcal/mol` (`0.0` at minimum).
     pub free_energy_kcal: Vec<Vec<f64>>,
     pub max_capped_kcal: f64,
+    pub bw_rmsd: f64,
+    pub bw_rg: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct PmfContourLevel {
+    pub level_kcal: f64,
+    /// Line segments `([rmsd_0, rg_0], [rmsd_1, rg_1])` in physical coordinate space.
+    pub segments: Vec<([f64; 2], [f64; 2])>,
+}
+
+/// Computes weighted standard deviation and interquartile range for Silverman/Scott 2D KDE bandwidth.
+fn adaptive_kde_bandwidth_1d(values: &[f64], weights: &[f64], n_eff: f64, domain_span: f64) -> f64 {
+    let min_bw = (domain_span / 20.0).max(0.12);
+    let max_bw = (domain_span / 4.2).max(min_bw);
+    if values.is_empty() {
+        return min_bw;
+    }
+
+    let w_sum: f64 = weights.iter().copied().filter(|w| *w > 0.0).sum();
+    let (mean, var) = if w_sum > 1.0e-12 {
+        let m: f64 = values
+            .iter()
+            .zip(weights.iter())
+            .map(|(&v, &w)| v * w)
+            .sum::<f64>()
+            / w_sum;
+        let v: f64 = values
+            .iter()
+            .zip(weights.iter())
+            .map(|(&val, &w)| {
+                let d = val - m;
+                w * d * d
+            })
+            .sum::<f64>()
+            / w_sum;
+        (m, v)
+    } else {
+        let n = values.len() as f64;
+        let m = values.iter().sum::<f64>() / n;
+        let v = values
+            .iter()
+            .map(|&val| {
+                let d = val - m;
+                d * d
+            })
+            .sum::<f64>()
+            / n;
+        (m, v)
+    };
+    let _ = mean;
+    let std_dev = var.max(0.0).sqrt();
+
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let q25 = sorted[(sorted.len() - 1) / 4];
+    let q75 = sorted[((sorted.len() - 1) * 3) / 4];
+    let iqr_scale = (q75 - q25) / 1.34;
+
+    let spread = if iqr_scale > 1.0e-5 && std_dev > 1.0e-5 {
+        std_dev.min(iqr_scale)
+    } else if std_dev > 1.0e-5 {
+        std_dev
+    } else {
+        domain_span / 8.0
+    };
+
+    // 2D Silverman/Scott rule-of-thumb (`d = 2` => exponent `-1 / (d + 4) = -1/6`)
+    let silverman = 0.96 * n_eff.max(4.0).powf(-1.0 / 6.0) * spread;
+    silverman.clamp(min_bw, max_bw)
 }
 
 /// Evaluates an equilibrium MSM-reweighted 2D Gaussian Kernel Density Potential of Mean Force
-/// `W(RMSD, R_g) = -k_B * T * ln P_eq(RMSD, R_g)` where each frame inside microstate `i` carries
-/// equilibrium statistical weight `pi_i / count(i)`.
+/// `W(RMSD, R_g) = -k_B * T * ln P_eq(RMSD, R_g)` using Silverman/Scott adaptive bandwidths,
+/// where each frame inside microstate `i` carries equilibrium statistical weight `pi_i / count(i)`.
 pub fn compute_2d_pmf_grid(
     frames: &[ConformationalFrame],
     clustering: &MicrostateClustering,
@@ -128,10 +198,6 @@ pub fn compute_2d_pmf_grid(
     rg_min = (rg_min - rg_pad).max(1.0);
     rg_max += rg_pad;
 
-    let bw_rmsd = ((rmsd_max - rmsd_min) / 7.5).max(0.25);
-    let bw_rg = ((rg_max - rg_min) / 7.5).max(0.25);
-    let kbt = K_BOLTZMANN_KCAL * msm.reference_temp_kelvin.max(1.0);
-
     let frame_weights: Vec<f64> = frames
         .iter()
         .enumerate()
@@ -146,6 +212,20 @@ pub fn compute_2d_pmf_grid(
         })
         .collect();
 
+    let w_sum: f64 = frame_weights.iter().sum();
+    let w_sq_sum: f64 = frame_weights.iter().map(|&w| w * w).sum();
+    let n_eff = if w_sq_sum > 1.0e-18 {
+        ((w_sum * w_sum) / w_sq_sum).max(4.0)
+    } else {
+        (frames.len() as f64).max(4.0)
+    };
+
+    let rmsd_vals: Vec<f64> = frames.iter().map(|f| f.rmsd_to_lowest_energy_ang).collect();
+    let rg_vals: Vec<f64> = frames.iter().map(|f| f.rg_angstrom).collect();
+    let bw_rmsd = adaptive_kde_bandwidth_1d(&rmsd_vals, &frame_weights, n_eff, rmsd_max - rmsd_min);
+    let bw_rg = adaptive_kde_bandwidth_1d(&rg_vals, &frame_weights, n_eff, rg_max - rg_min);
+    let kbt = K_BOLTZMANN_KCAL * msm.reference_temp_kelvin.max(1.0);
+
     let mut density = vec![vec![0.0f64; ny]; nx];
     let mut max_dens = 0.0f64;
 
@@ -158,7 +238,7 @@ pub fn compute_2d_pmf_grid(
                 let dx = (x - f.rmsd_to_lowest_energy_ang) / bw_rmsd;
                 let dy = (y - f.rg_angstrom) / bw_rg;
                 let r2 = dx * dx + dy * dy;
-                if r2 < 16.0 {
+                if r2 < 25.0 {
                     sum_p += w * (-0.5 * r2).exp();
                 }
             }
@@ -190,7 +270,108 @@ pub fn compute_2d_pmf_grid(
         rg_max,
         free_energy_kcal: fe,
         max_capped_kcal: cap_kcal,
+        bw_rmsd,
+        bw_rg,
     }
+}
+
+/// Extracts smooth iso-energy contour segments (`kcal/mol`) from a 2D PMF grid via
+/// Marching Squares with saddle disambiguation at cell midpoints.
+pub fn extract_pmf_iso_contours(grid: &PmfGrid2D, levels_kcal: &[f64]) -> Vec<PmfContourLevel> {
+    if grid.nx < 2 || grid.ny < 2 {
+        return Vec::new();
+    }
+
+    let x_at = |ix: usize| -> f64 {
+        grid.rmsd_min + ((ix as f64 + 0.5) / (grid.nx as f64)) * (grid.rmsd_max - grid.rmsd_min)
+    };
+    let y_at = |iy: usize| -> f64 {
+        grid.rg_min + ((iy as f64 + 0.5) / (grid.ny as f64)) * (grid.rg_max - grid.rg_min)
+    };
+
+    let interp = |p0: [f64; 2], v0: f64, p1: [f64; 2], v1: f64, level: f64| -> [f64; 2] {
+        let dv = v1 - v0;
+        let t = if dv.abs() < 1.0e-12 {
+            0.5
+        } else {
+            ((level - v0) / dv).clamp(0.0, 1.0)
+        };
+        [p0[0] + t * (p1[0] - p0[0]), p0[1] + t * (p1[1] - p0[1])]
+    };
+
+    let mut out = Vec::with_capacity(levels_kcal.len());
+    for &level in levels_kcal {
+        let mut segments = Vec::new();
+        for ix in 0..(grid.nx - 1) {
+            let x0 = x_at(ix);
+            let x1 = x_at(ix + 1);
+            for iy in 0..(grid.ny - 1) {
+                let y0 = y_at(iy);
+                let y1 = y_at(iy + 1);
+
+                // Cell corners: 0=BL, 1=BR, 2=TR, 3=TL
+                let v0 = grid.free_energy_kcal[ix][iy];
+                let v1 = grid.free_energy_kcal[ix + 1][iy];
+                let v2 = grid.free_energy_kcal[ix + 1][iy + 1];
+                let v3 = grid.free_energy_kcal[ix][iy + 1];
+
+                let p0 = [x0, y0];
+                let p1 = [x1, y0];
+                let p2 = [x1, y1];
+                let p3 = [x0, y1];
+
+                let mask = ((v0 >= level) as u8)
+                    | (((v1 >= level) as u8) << 1)
+                    | (((v2 >= level) as u8) << 2)
+                    | (((v3 >= level) as u8) << 3);
+
+                if mask == 0 || mask == 15 {
+                    continue;
+                }
+
+                // Edges: 0=bottom(0-1), 1=right(1-2), 2=top(2-3), 3=left(3-0)
+                let e0 = || interp(p0, v0, p1, v1, level);
+                let e1 = || interp(p1, v1, p2, v2, level);
+                let e2 = || interp(p2, v2, p3, v3, level);
+                let e3 = || interp(p3, v3, p0, v0, level);
+
+                match mask {
+                    1 | 14 => segments.push((e3(), e0())),
+                    2 | 13 => segments.push((e0(), e1())),
+                    3 | 12 => segments.push((e3(), e1())),
+                    4 | 11 => segments.push((e1(), e2())),
+                    6 | 9 => segments.push((e0(), e2())),
+                    7 | 8 => segments.push((e3(), e2())),
+                    5 => {
+                        let center_val = 0.25 * (v0 + v1 + v2 + v3);
+                        if center_val >= level {
+                            segments.push((e3(), e2()));
+                            segments.push((e0(), e1()));
+                        } else {
+                            segments.push((e3(), e0()));
+                            segments.push((e1(), e2()));
+                        }
+                    }
+                    10 => {
+                        let center_val = 0.25 * (v0 + v1 + v2 + v3);
+                        if center_val >= level {
+                            segments.push((e3(), e0()));
+                            segments.push((e1(), e2()));
+                        } else {
+                            segments.push((e3(), e2()));
+                            segments.push((e0(), e1()));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        out.push(PmfContourLevel {
+            level_kcal: level,
+            segments,
+        });
+    }
+    out
 }
 
 fn write_microstate_csv(
@@ -318,6 +499,31 @@ fn write_academic_landscape_svg(
         let fy = ((rg - grid.rg_min) / (grid.rg_max - grid.rg_min).max(1e-6)).clamp(0.0, 1.0);
         (plot_x0 + fx * plot_w, plot_y0 + plot_h - fy * plot_h)
     };
+
+    // Iso-energy contour lines (1, 2, 3 kcal/mol) via Marching Squares
+    let contours = extract_pmf_iso_contours(grid, &[1.0, 2.0, 3.0]);
+    for c_lvl in &contours {
+        let (stroke_col, stroke_w, dash) = if (c_lvl.level_kcal - 1.0).abs() < 0.1 {
+            ("#F8FAFC", "1.1", "none")
+        } else if (c_lvl.level_kcal - 2.0).abs() < 0.1 {
+            ("#94A3B8", "0.95", "4,2")
+        } else {
+            ("#64748B", "0.85", "2,2")
+        };
+        let dash_attr = if dash == "none" {
+            String::new()
+        } else {
+            format!(" stroke-dasharray=\"{dash}\"")
+        };
+        for &(p0, p1) in &c_lvl.segments {
+            let (x1, y1) = map_xy(p0[0], p0[1]);
+            let (x2, y2) = map_xy(p1[0], p1[1]);
+            writeln!(
+                w,
+                r##"<line x1="{x1:.1}" y1="{y1:.1}" x2="{x2:.1}" y2="{y2:.1}" stroke="{stroke_col}" stroke-opacity="0.72" stroke-width="{stroke_w}"{dash_attr}/>"##
+            )?;
+        }
+    }
 
     for i in 0..msm.num_microstates {
         let orig_i = msm.active_microstates[i];
@@ -594,4 +800,106 @@ fn write_json_report(
     writeln!(w, "}}")?;
     w.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clustering::{cluster_conformations_kmedoids, compute_pairwise_rmsd_matrix};
+    use crate::transition::estimate_reversible_msm;
+    use fold_physics::ProteinTopology;
+    use fold_proto::WorkUnitId;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TempDirGuard(PathBuf);
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn pmf_40x40_adaptive_kde_and_iso_contours_generate_valid_segments() {
+        let (topo, base) = ProteinTopology::build_polypeptide_from_sequence("WKDG", "WKDG");
+        let mut frames = Vec::new();
+        for run in 0..2u32 {
+            for step in 0..10u32 {
+                let mut pos = base.clone();
+                let shift = ((step as f32) - 4.5).abs() * 0.6 + (run as f32) * 0.4;
+                for (ai, p) in pos.iter_mut().enumerate() {
+                    p[0] += (ai as f32) * 0.12 * shift;
+                }
+                frames.push(ConformationalFrame {
+                    frame_idx: frames.len(),
+                    wu_id: WorkUnitId::new(1, run, 0, step),
+                    chain_step: step,
+                    checkpoint_blake3: [0u8; 32],
+                    temperature_kelvin: 300.0,
+                    potential_energy_kcal: -50.0 + (shift as f64) * 3.0,
+                    rg_angstrom: 5.5 + (shift as f64) * 0.8,
+                    sasa_angstrom2: 600.0,
+                    rmsd_to_seed_ang: shift as f64,
+                    rmsd_to_lowest_energy_ang: shift as f64,
+                    positions_angstrom: pos,
+                });
+            }
+        }
+        let rmsd_mat = compute_pairwise_rmsd_matrix(&topo, &frames);
+        let clustering = cluster_conformations_kmedoids(&frames, &rmsd_mat, 4, None);
+        let msm = estimate_reversible_msm(&frames, &clustering, 1, 0.5, 300.0, 2)
+            .expect("reversible MSM");
+
+        let grid = compute_2d_pmf_grid(&frames, &clustering, &msm, 40, 40);
+        assert_eq!(grid.nx, 40);
+        assert_eq!(grid.ny, 40);
+        assert!(grid.bw_rmsd.is_finite() && grid.bw_rmsd > 0.0);
+        assert!(grid.bw_rg.is_finite() && grid.bw_rg > 0.0);
+
+        let contours = extract_pmf_iso_contours(&grid, &[1.0, 2.0, 3.0]);
+        assert_eq!(contours.len(), 3);
+        let total_segs: usize = contours.iter().map(|c| c.segments.len()).sum();
+        assert!(
+            total_segs > 0,
+            "40x40 PMF grid must emit iso-energy contour segments across 1/2/3 kcal/mol"
+        );
+        for lvl in &contours {
+            for &(p0, p1) in &lvl.segments {
+                assert!(p0[0].is_finite() && p0[1].is_finite());
+                assert!(p1[0].is_finite() && p1[1].is_finite());
+                assert!(p0[0] >= grid.rmsd_min - 1e-9 && p0[0] <= grid.rmsd_max + 1e-9);
+                assert!(p0[1] >= grid.rg_min - 1e-9 && p0[1] <= grid.rg_max + 1e-9);
+            }
+        }
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp = std::env::temp_dir().join(format!("beofold_pmf_40_{}_{}", std::process::id(), nanos));
+        let _guard = TempDirGuard(tmp.clone());
+        let manifest = ProjectManifest {
+            project_id: 1,
+            name: topo.name.clone(),
+            sequence: topo.sequence_one_letter.clone(),
+            topology_blake3: [0u8; 32],
+            initial_coords_blake3: [0u8; 32],
+            atom_count: topo.atoms.len() as u32,
+            residue_count: topo.residue_count,
+            temp_ladder_kelvin: vec![300.0],
+            dt_fs: 1.5,
+            friction_per_ps: 1.0,
+            steps_per_gen: 100,
+            num_clones_per_run: 1,
+            max_generations: 10,
+        };
+        let exported = export_msm_bundle(&tmp, &manifest, &topo, &frames, &clustering, &msm)
+            .expect("export 40x40 MSM bundle");
+        let csv_lines = fs::read_to_string(&exported.pmf_grid_csv_path)
+            .expect("read PMF CSV")
+            .lines()
+            .count();
+        assert_eq!(csv_lines, 1 + 40 * 40, "CSV must contain header + 1600 40x40 cells");
+        let svg_text = fs::read_to_string(&exported.svg_landscape_path).expect("read SVG");
+        assert!(svg_text.contains("<line "), "SVG must render iso-energy contours");
+    }
 }

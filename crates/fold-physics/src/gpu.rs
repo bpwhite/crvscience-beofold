@@ -13,6 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://gnu.org>.
 
+use crate::forcefield::{eef1_solvation_weight, GB_EPSILON_IN, GB_EPSILON_OUT};
 use crate::topology::ProteinTopology;
 use crate::COULOMB_KCAL_A_E2;
 use bytemuck::{Pod, Zeroable};
@@ -47,8 +48,8 @@ pub struct GpuAdapterSummary {
 struct GpuUniforms {
     atom_count: u32,
     cutoff_ang: f32,
-    coulomb_quarter: f32,
-    _pad: u32,
+    coulomb_const: f32,
+    inv_eps_out: f32,
 }
 
 #[repr(C)]
@@ -60,8 +61,8 @@ struct GpuAtomParams {
     flags: u32,
     excl_offset: u32,
     excl_count: u32,
-    _pad0: u32,
-    _pad1: u32,
+    gb_radius_ang: f32,
+    solv_weight: f32,
 }
 
 #[repr(C)]
@@ -156,8 +157,8 @@ impl GpuForceEngine {
         let uniforms = GpuUniforms {
             atom_count: atom_count as u32,
             cutoff_ang: GPU_NONBONDED_CUTOFF_ANG,
-            coulomb_quarter: (COULOMB_KCAL_A_E2 / 4.0) as f32,
-            _pad: 0,
+            coulomb_const: (COULOMB_KCAL_A_E2 / GB_EPSILON_IN) as f32,
+            inv_eps_out: (GB_EPSILON_IN / GB_EPSILON_OUT) as f32,
         };
 
         let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -412,8 +413,8 @@ fn build_csr_exclusion_tables(topology: &ProteinTopology) -> (Vec<GpuAtomParams>
             flags: if atom.is_backbone { 1u32 } else { 0u32 },
             excl_offset: offset,
             excl_count: count,
-            _pad0: 0,
-            _pad1: 0,
+            gb_radius_ang: atom.gb_radius_ang.max(0.5),
+            solv_weight: eef1_solvation_weight(atom),
         });
     }
 

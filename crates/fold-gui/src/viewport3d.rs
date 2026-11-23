@@ -61,6 +61,13 @@ impl Default for ConformationViewport {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SecondaryStructure {
+    Helix,
+    Sheet,
+    Coil,
+}
+
 enum DepthPrimitive {
     Bond {
         z_mid: f32,
@@ -68,6 +75,14 @@ enum DepthPrimitive {
         p1: Pos2,
         width: f32,
         color: Color32,
+    },
+    Ribbon {
+        z_mid: f32,
+        p0: Pos2,
+        p1: Pos2,
+        width: f32,
+        color: Color32,
+        highlight: Color32,
     },
     Sphere {
         z_depth: f32,
@@ -182,9 +197,7 @@ impl ConformationViewport {
         let base_scale = rect.width().min(rect.height()) * 0.40 * self.zoom / scale_extent;
         let screen_origin = rect.center() + self.pan;
 
-        // Project every atom into `(screen_pos, view_z, perspective_factor)`
-        let mut projected: Vec<(Pos2, f32, f32)> = Vec::with_capacity(positions.len());
-        for p in positions {
+        let project_point = |p: [f32; 3]| -> (Pos2, f32, f32) {
             let x0 = p[0] - cx;
             let y0 = p[1] - cy;
             let z0 = p[2] - cz;
@@ -198,51 +211,115 @@ impl ConformationViewport {
             let persp = cam_dist / (cam_dist - z2).max(2.0);
             let sx = screen_origin.x + x1 * base_scale * persp;
             let sy_scr = screen_origin.y - y2 * base_scale * persp;
-            projected.push((Pos2::new(sx, sy_scr), z2, persp));
+            (Pos2::new(sx, sy_scr), z2, persp)
+        };
+
+        // Project every atom into `(screen_pos, view_z, perspective_factor)`
+        let mut projected: Vec<(Pos2, f32, f32)> = Vec::with_capacity(positions.len());
+        for &p in positions {
+            projected.push(project_point(p));
         }
 
-        let mut prims: Vec<DepthPrimitive> = Vec::with_capacity(positions.len() * 2);
+        let mut prims: Vec<DepthPrimitive> = Vec::with_capacity(positions.len() * 6);
 
-        // 1. Always build sequential C-alpha backbone trace colored N-terminus -> C-terminus
+        // 1. Sequential C-alpha Catmull-Rom spline ribbon colored by secondary structure (Helix/Sheet/Coil)
         let ca_indices: Vec<usize> = topology
             .atoms
             .iter()
             .enumerate()
             .filter_map(|(idx, a)| if a.is_ca { Some(idx) } else { None })
             .collect();
+        let ss_classes = classify_secondary_structure(topology, positions, &ca_indices);
 
-        let ca_total = ca_indices.len().max(2) as f32;
-        for w_idx in 0..ca_indices.len().saturating_sub(1) {
-            let a = ca_indices[w_idx];
-            let b = ca_indices[w_idx + 1];
-            let frac = (w_idx as f32) / (ca_total - 1.0);
-            let ribbon_col = n_to_c_gradient(frac);
-            let z_mid = 0.5 * (projected[a].1 + projected[b].1);
-            let persp_mid = 0.5 * (projected[a].2 + projected[b].2);
-            let width = match self.representation {
-                RenderRepresentation::CAlphaRibbonOnly => 4.2 * persp_mid,
-                RenderRepresentation::BackboneAndSidechains => 3.6 * persp_mid,
-                RenderRepresentation::AllHeavyAtoms => 1.8 * persp_mid,
+        let ca_len = ca_indices.len();
+        const SPLINE_SUBSTEPS: usize = 6;
+        for w_idx in 0..ca_len.saturating_sub(1) {
+            let idx1 = ca_indices[w_idx];
+            let idx2 = ca_indices[w_idx + 1];
+            let p1 = positions[idx1];
+            let p2 = positions[idx2];
+            let p0 = if w_idx > 0 {
+                positions[ca_indices[w_idx - 1]]
+            } else {
+                [
+                    2.0 * p1[0] - p2[0],
+                    2.0 * p1[1] - p2[1],
+                    2.0 * p1[2] - p2[2],
+                ]
             };
-            prims.push(DepthPrimitive::Bond {
-                z_mid,
-                p0: projected[a].0,
-                p1: projected[b].0,
-                width: width.clamp(1.2, 8.0),
-                color: depth_cue_color(ribbon_col, z_mid, max_extent),
-            });
+            let p3 = if w_idx + 2 < ca_len {
+                positions[ca_indices[w_idx + 2]]
+            } else {
+                [
+                    2.0 * p2[0] - p1[0],
+                    2.0 * p2[1] - p1[1],
+                    2.0 * p2[2] - p1[2],
+                ]
+            };
+
+            let ss_seg = if ss_classes[w_idx] == ss_classes[w_idx + 1] {
+                ss_classes[w_idx]
+            } else if ss_classes[w_idx] != SecondaryStructure::Coil {
+                ss_classes[w_idx]
+            } else {
+                ss_classes[w_idx + 1]
+            };
+            let base_col = secondary_structure_color(ss_seg);
+            let width_factor = match (self.representation, ss_seg) {
+                (RenderRepresentation::CAlphaRibbonOnly, SecondaryStructure::Helix) => 6.4,
+                (RenderRepresentation::CAlphaRibbonOnly, SecondaryStructure::Sheet) => 5.8,
+                (RenderRepresentation::CAlphaRibbonOnly, SecondaryStructure::Coil) => 3.4,
+                (RenderRepresentation::BackboneAndSidechains, SecondaryStructure::Helix) => 5.0,
+                (RenderRepresentation::BackboneAndSidechains, SecondaryStructure::Sheet) => 4.6,
+                (RenderRepresentation::BackboneAndSidechains, SecondaryStructure::Coil) => 3.0,
+                (RenderRepresentation::AllHeavyAtoms, _) => 1.8,
+            };
+
+            let mut prev_proj = project_point(p1);
+            for sub in 1..=SPLINE_SUBSTEPS {
+                let t = (sub as f32) / (SPLINE_SUBSTEPS as f32);
+                let pt_3d = catmull_rom_point(p0, p1, p2, p3, t);
+                let cur_proj = project_point(pt_3d);
+                let z_mid = 0.5 * (prev_proj.1 + cur_proj.1);
+                let persp_mid = 0.5 * (prev_proj.2 + cur_proj.2);
+                let body_col = depth_cue_color(base_col, z_mid, max_extent);
+                let hi_col = ribbon_highlight_color(body_col);
+
+                if self.representation == RenderRepresentation::AllHeavyAtoms {
+                    prims.push(DepthPrimitive::Bond {
+                        z_mid,
+                        p0: prev_proj.0,
+                        p1: cur_proj.0,
+                        width: (width_factor * persp_mid).clamp(1.2, 4.0),
+                        color: body_col,
+                    });
+                } else {
+                    prims.push(DepthPrimitive::Ribbon {
+                        z_mid,
+                        p0: prev_proj.0,
+                        p1: cur_proj.0,
+                        width: (width_factor * persp_mid).clamp(1.6, 11.5),
+                        color: body_col,
+                        highlight: hi_col,
+                    });
+                }
+                prev_proj = cur_proj;
+            }
         }
 
         // 2. Sidechain C-alpha -> C-beta stems or full covalent bond sticks
         match self.representation {
             RenderRepresentation::CAlphaRibbonOnly => {
                 for (order, &idx) in ca_indices.iter().enumerate() {
-                    let frac = (order as f32) / (ca_total - 1.0);
-                    let col = depth_cue_color(n_to_c_gradient(frac), projected[idx].1, max_extent);
+                    let col = depth_cue_color(
+                        secondary_structure_color(ss_classes[order]),
+                        projected[idx].1,
+                        max_extent,
+                    );
                     prims.push(DepthPrimitive::Sphere {
                         z_depth: projected[idx].1,
                         screen: projected[idx].0,
-                        radius: (4.8 * projected[idx].2 * self.zoom.sqrt()).clamp(2.5, 13.0),
+                        radius: (3.6 * projected[idx].2 * self.zoom.sqrt()).clamp(2.0, 9.5),
                         color: col,
                         atom_idx: idx,
                     });
@@ -325,10 +402,12 @@ impl ConformationViewport {
         prims.sort_by(|a, b| {
             let za = match a {
                 DepthPrimitive::Bond { z_mid, .. } => *z_mid,
+                DepthPrimitive::Ribbon { z_mid, .. } => *z_mid,
                 DepthPrimitive::Sphere { z_depth, .. } => *z_depth,
             };
             let zb = match b {
                 DepthPrimitive::Bond { z_mid, .. } => *z_mid,
+                DepthPrimitive::Ribbon { z_mid, .. } => *z_mid,
                 DepthPrimitive::Sphere { z_depth, .. } => *z_depth,
             };
             za.partial_cmp(&zb).unwrap_or(std::cmp::Ordering::Equal)
@@ -347,6 +426,21 @@ impl ConformationViewport {
                     ..
                 } => {
                     painter.line_segment([p0, p1], Stroke::new(width, color));
+                }
+                DepthPrimitive::Ribbon {
+                    p0,
+                    p1,
+                    width,
+                    color,
+                    highlight,
+                    ..
+                } => {
+                    let outline = Color32::from_rgba_unmultiplied(10, 14, 22, 210);
+                    painter.circle_filled(p0, (width + 1.4) * 0.5, outline);
+                    painter.line_segment([p0, p1], Stroke::new(width + 1.4, outline));
+                    painter.circle_filled(p0, width * 0.5, color);
+                    painter.line_segment([p0, p1], Stroke::new(width, color));
+                    painter.line_segment([p0, p1], Stroke::new((width * 0.28).max(0.8), highlight));
                 }
                 DepthPrimitive::Sphere {
                     screen,
@@ -433,6 +527,80 @@ impl ConformationViewport {
             );
         }
 
+        // Angstrom scale bar & XYZ orientation triad above legend on bottom-right
+        let (bar_ang, bar_px) = choose_scale_bar_angstrom(base_scale);
+        let scale_y = legend_y - 16.0;
+        let scale_x1 = rect.right() - 14.0;
+        let scale_x0 = (scale_x1 - bar_px).max(rect.left() + 14.0);
+        let bar_stroke = Stroke::new(1.8_f32, Color32::from_rgb(203, 213, 225));
+        hud_painter.line_segment(
+            [Pos2::new(scale_x0, scale_y), Pos2::new(scale_x1, scale_y)],
+            bar_stroke,
+        );
+        hud_painter.line_segment(
+            [
+                Pos2::new(scale_x0, scale_y - 4.0),
+                Pos2::new(scale_x0, scale_y + 4.0),
+            ],
+            bar_stroke,
+        );
+        hud_painter.line_segment(
+            [
+                Pos2::new(scale_x1, scale_y - 4.0),
+                Pos2::new(scale_x1, scale_y + 4.0),
+            ],
+            bar_stroke,
+        );
+        hud_painter.text(
+            Pos2::new(0.5 * (scale_x0 + scale_x1), scale_y - 5.0),
+            Align2::CENTER_BOTTOM,
+            format!("{:.0} \u{00C5}", bar_ang),
+            FontId::monospace(10.0),
+            Color32::from_rgb(226, 232, 240),
+        );
+
+        let triad_center = Pos2::new(rect.right() - 36.0, scale_y - 44.0);
+        let triad_len = 20.0f32;
+        let mut axes = [
+            (
+                "X",
+                [1.0f32, 0.0, 0.0],
+                Color32::from_rgb(248, 113, 113),
+            ),
+            (
+                "Y",
+                [0.0f32, 1.0, 0.0],
+                Color32::from_rgb(52, 211, 153),
+            ),
+            (
+                "Z",
+                [0.0f32, 0.0, 1.0],
+                Color32::from_rgb(56, 189, 248),
+            ),
+        ]
+        .map(|(lbl, v, col)| {
+            let x1 = v[0] * cy_ang + v[2] * sy;
+            let z1 = -v[0] * sy + v[2] * cy_ang;
+            let y2 = v[1] * cp_ang - z1 * sp;
+            let z2 = v[1] * sp + z1 * cp_ang;
+            (lbl, x1, y2, z2, col)
+        });
+        axes.sort_by(|a, b| a.3.partial_cmp(&b.3).unwrap_or(std::cmp::Ordering::Equal));
+        hud_painter.circle_filled(triad_center, 2.0, Color32::from_rgb(203, 213, 225));
+        for (lbl, ax, ay, _, col) in axes {
+            let tip = Pos2::new(
+                triad_center.x + ax * triad_len,
+                triad_center.y - ay * triad_len,
+            );
+            hud_painter.line_segment([triad_center, tip], Stroke::new(1.8_f32, col));
+            hud_painter.circle_filled(tip, 2.2, col);
+            let lbl_pos = Pos2::new(
+                triad_center.x + ax * (triad_len + 8.5),
+                triad_center.y - ay * (triad_len + 8.5),
+            );
+            hud_painter.text(lbl_pos, Align2::CENTER_CENTER, lbl, FontId::monospace(9.5), col);
+        }
+
         // Interactive atom/residue tooltip on hover (positioned cleanly below header)
         if let Some((idx, scr)) = hovered_atom {
             let a = &topology.atoms[idx];
@@ -466,8 +634,8 @@ pub(crate) struct HudLegendLayout {
 
 pub(crate) fn compute_hud_legend_layout(rect_width: f32) -> HudLegendLayout {
     if rect_width >= 760.0 {
-        let line = "Gold: Hydrophobic Core  |  Sky: Basic (+K/R)  |  Coral: Acidic (-D/E)  |  Teal: Polar  |  Drag: Orbit  Scroll: Zoom";
-        let font_size = 10.0;
+        let line = "Ribbon: Helix(Rose) Sheet(Sky) Coil(Slate) | Beads: Hydrophobic(Gold) +K/R(Sky) -D/E(Coral) Polar(Teal)";
+        let font_size = 9.5;
         let est = (line.len() as f32) * (font_size * 0.60);
         HudLegendLayout {
             two_line_header: false,
@@ -478,7 +646,7 @@ pub(crate) fn compute_hud_legend_layout(rect_width: f32) -> HudLegendLayout {
             estimated_max_line_px: est,
         }
     } else if rect_width >= 380.0 {
-        let line = "Gold: Hydrophobic | Sky: +K/R | Coral: -D/E | Teal: Polar";
+        let line = "Ribbon: Helix/Sheet/Coil | Gold:Hydro +K/R -D/E";
         let font_size = 9.5;
         let est = (line.len() as f32) * (font_size * 0.60);
         HudLegendLayout {
@@ -490,8 +658,8 @@ pub(crate) fn compute_hud_legend_layout(rect_width: f32) -> HudLegendLayout {
             estimated_max_line_px: est,
         }
     } else {
-        let line1 = "Gold: Hydrophob | Sky: +K/R";
-        let line2 = "Coral: -D/E | Teal: Polar";
+        let line1 = "Ribbon: Helix/Sheet/Coil";
+        let line2 = "Gold:Hydro +K/R -D/E Teal:Polar";
         let font_size = 9.0;
         let max_chars = line1.len().max(line2.len()) as f32;
         HudLegendLayout {
@@ -505,25 +673,238 @@ pub(crate) fn compute_hud_legend_layout(rect_width: f32) -> HudLegendLayout {
     }
 }
 
-fn n_to_c_gradient(t: f32) -> Color32 {
-    let f = t.clamp(0.0, 1.0);
-    // N-terminus cyan-blue (56, 189, 248) -> midpoint emerald (52, 211, 153) -> C-terminus amber (251, 146, 60)
-    let (r, g, b) = if f < 0.5 {
-        let u = f * 2.0;
-        (
-            lerp(56.0, 52.0, u),
-            lerp(189.0, 211.0, u),
-            lerp(248.0, 153.0, u),
-        )
-    } else {
-        let u = (f - 0.5) * 2.0;
-        (
-            lerp(52.0, 251.0, u),
-            lerp(211.0, 146.0, u),
-            lerp(153.0, 60.0, u),
-        )
+/// Evaluates uniform Catmull-Rom cubic spline position at `t in [0, 1]` between `p1` and `p2`.
+#[inline]
+pub(crate) fn catmull_rom_point(
+    p0: [f32; 3],
+    p1: [f32; 3],
+    p2: [f32; 3],
+    p3: [f32; 3],
+    t: f32,
+) -> [f32; 3] {
+    let t2 = t * t;
+    let t3 = t2 * t;
+    let mut out = [0.0f32; 3];
+    for d in 0..3 {
+        out[d] = 0.5
+            * ((2.0 * p1[d])
+                + (-p0[d] + p2[d]) * t
+                + (2.0 * p0[d] - 5.0 * p1[d] + 4.0 * p2[d] - p3[d]) * t2
+                + (-p0[d] + 3.0 * p1[d] - 3.0 * p2[d] + p3[d]) * t3);
+    }
+    out
+}
+
+/// Selects a clean Ångström scale bar length (`1, 2, 5, 10, 20, 50 Å`) targeting ~55–100 px.
+pub(crate) fn choose_scale_bar_angstrom(px_per_ang: f32) -> (f32, f32) {
+    let scale = px_per_ang.max(0.25);
+    let target_px = 72.0f32;
+    let candidates = [1.0f32, 2.0, 5.0, 10.0, 20.0, 50.0];
+    let mut best_ang = 5.0f32;
+    let mut best_err = f32::INFINITY;
+    for &c in &candidates {
+        let px = c * scale;
+        let penalty = if px < 28.0 || px > 125.0 { 200.0 } else { 0.0 };
+        let err = (px - target_px).abs() + penalty;
+        if err < best_err {
+            best_err = err;
+            best_ang = c;
+        }
+    }
+    (best_ang, (best_ang * scale).clamp(20.0, 140.0))
+}
+
+#[inline]
+fn dist3_f32(a: [f32; 3], b: [f32; 3]) -> f32 {
+    let dx = a[0] - b[0];
+    let dy = a[1] - b[1];
+    let dz = a[2] - b[2];
+    (dx * dx + dy * dy + dz * dz).sqrt()
+}
+
+fn dihedral_deg(a: [f32; 3], b: [f32; 3], c: [f32; 3], d: [f32; 3]) -> Option<f32> {
+    let b0 = [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+    let b1 = [c[0] - b[0], c[1] - b[1], c[2] - b[2]];
+    let b2 = [d[0] - c[0], d[1] - c[1], d[2] - c[2]];
+    let b1_len = (b1[0] * b1[0] + b1[1] * b1[1] + b1[2] * b1[2]).sqrt();
+    if b1_len < 1.0e-4 {
+        return None;
+    }
+    let b1n = [b1[0] / b1_len, b1[1] / b1_len, b1[2] / b1_len];
+    let dot = |u: [f32; 3], v: [f32; 3]| u[0] * v[0] + u[1] * v[1] + u[2] * v[2];
+    let cross = |u: [f32; 3], v: [f32; 3]| {
+        [
+            u[1] * v[2] - u[2] * v[1],
+            u[2] * v[0] - u[0] * v[2],
+            u[0] * v[1] - u[1] * v[0],
+        ]
     };
-    Color32::from_rgb(r as u8, g as u8, b as u8)
+    let v = [
+        b0[0] - dot(b0, b1n) * b1n[0],
+        b0[1] - dot(b0, b1n) * b1n[1],
+        b0[2] - dot(b0, b1n) * b1n[2],
+    ];
+    let w = [
+        b2[0] - dot(b2, b1n) * b1n[0],
+        b2[1] - dot(b2, b1n) * b1n[1],
+        b2[2] - dot(b2, b1n) * b1n[2],
+    ];
+    let x = dot(v, w);
+    let y = dot(cross(b1n, v), w);
+    if x.abs() < 1.0e-6 && y.abs() < 1.0e-6 {
+        return None;
+    }
+    Some(y.atan2(x).to_degrees())
+}
+
+/// Classifies each C-alpha residue into Helix, Sheet, or Coil using backbone `(phi, psi)`
+/// dihedrals plus local C-alpha geometry (`d(i, i+2)`, `d(i, i+3)`, virtual torsion) and
+/// minimum run-length smoothing (`>= 3` for helices, `>= 2` for sheets).
+pub(crate) fn classify_secondary_structure(
+    topology: &ProteinTopology,
+    positions: &[[f32; 3]],
+    ca_indices: &[usize],
+) -> Vec<SecondaryStructure> {
+    let m = ca_indices.len();
+    let mut raw = vec![SecondaryStructure::Coil; m];
+    if m < 4 {
+        return raw;
+    }
+
+    // Locate backbone N and C positions matching each CA residue
+    let mut n_pos: Vec<Option<[f32; 3]>> = vec![None; m];
+    let mut c_pos: Vec<Option<[f32; 3]>> = vec![None; m];
+    for (k, &ca_idx) in ca_indices.iter().enumerate() {
+        let ca_atom = &topology.atoms[ca_idx];
+        let lo = ca_idx.saturating_sub(4);
+        let hi = (ca_idx + 5).min(topology.atoms.len());
+        for a_idx in lo..hi {
+            let a = &topology.atoms[a_idx];
+            if a.chain_id == ca_atom.chain_id && a.res_seq == ca_atom.res_seq {
+                if a.name == "N" {
+                    n_pos[k] = Some(positions[a_idx]);
+                } else if a.name == "C" {
+                    c_pos[k] = Some(positions[a_idx]);
+                }
+            }
+        }
+    }
+
+    for k in 0..m {
+        let ca_k = positions[ca_indices[k]];
+        let phi = if k > 0 {
+            match (c_pos[k - 1], n_pos[k], c_pos[k]) {
+                (Some(pc), Some(nk), Some(ck)) => dihedral_deg(pc, nk, ca_k, ck),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let psi = if k + 1 < m {
+            match (n_pos[k], c_pos[k], n_pos[k + 1]) {
+                (Some(nk), Some(ck), Some(nn)) => dihedral_deg(nk, ca_k, ck, nn),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        let d_i_i2 = if k + 2 < m {
+            Some(dist3_f32(ca_k, positions[ca_indices[k + 2]]))
+        } else if k >= 2 {
+            Some(dist3_f32(positions[ca_indices[k - 2]], ca_k))
+        } else {
+            None
+        };
+        let d_i_i3 = if k + 3 < m {
+            Some(dist3_f32(ca_k, positions[ca_indices[k + 3]]))
+        } else if k >= 3 {
+            Some(dist3_f32(positions[ca_indices[k - 3]], ca_k))
+        } else {
+            None
+        };
+        let ca_tau = if k >= 1 && k + 2 < m {
+            dihedral_deg(
+                positions[ca_indices[k - 1]],
+                ca_k,
+                positions[ca_indices[k + 1]],
+                positions[ca_indices[k + 2]],
+            )
+        } else {
+            None
+        };
+
+        let rama_helix = matches!(
+            (phi, psi),
+            (Some(ph), Some(ps)) if (-115.0..=-25.0).contains(&ph) && (-80.0..=-5.0).contains(&ps)
+        );
+        let geom_helix = matches!(
+            (d_i_i2, d_i_i3, ca_tau),
+            (Some(d2), Some(d3), Some(tau))
+                if (4.5..=6.3).contains(&d2)
+                    && (4.3..=6.5).contains(&d3)
+                    && (10.0..=95.0).contains(&tau)
+        );
+        let helix_compact = d_i_i3.map(|d3| d3 < 6.8).unwrap_or(true);
+
+        if geom_helix || (rama_helix && helix_compact) {
+            raw[k] = SecondaryStructure::Helix;
+            continue;
+        }
+
+        let has_beta_partner = (0..m).any(|other| {
+            other.abs_diff(k) >= 4
+                && dist3_f32(ca_k, positions[ca_indices[other]]) <= 6.2
+        });
+        let rama_beta = matches!(
+            (phi, psi),
+            (Some(ph), Some(ps)) if (-175.0..=-45.0).contains(&ph) && (ps >= 75.0 || ps <= -145.0)
+        );
+        let geom_beta = matches!(
+            (d_i_i2, ca_tau),
+            (Some(d2), Some(tau)) if (5.8..=7.6).contains(&d2) && tau.abs() > 110.0
+        );
+        if has_beta_partner && (rama_beta || geom_beta) {
+            raw[k] = SecondaryStructure::Sheet;
+        }
+    }
+
+    // Smooth isolated singletons: require run >= 3 for Helix, >= 2 for Sheet
+    let mut smoothed = vec![SecondaryStructure::Coil; m];
+    let mut idx = 0usize;
+    while idx < m {
+        let kind = raw[idx];
+        let mut end = idx + 1;
+        while end < m && raw[end] == kind {
+            end += 1;
+        }
+        let run_len = end - idx;
+        let keep = match kind {
+            SecondaryStructure::Helix => run_len >= 3,
+            SecondaryStructure::Sheet => run_len >= 2,
+            SecondaryStructure::Coil => false,
+        };
+        if keep {
+            for item in &mut smoothed[idx..end] {
+                *item = kind;
+            }
+        }
+        idx = end;
+    }
+    smoothed
+}
+
+fn secondary_structure_color(ss: SecondaryStructure) -> Color32 {
+    match ss {
+        SecondaryStructure::Helix => Color32::from_rgb(244, 92, 132),
+        SecondaryStructure::Sheet => Color32::from_rgb(56, 189, 248),
+        SecondaryStructure::Coil => Color32::from_rgb(156, 176, 202),
+    }
+}
+
+fn ribbon_highlight_color(c: Color32) -> Color32 {
+    let lift = |ch: u8| ((ch as u16) + ((255 - (ch as u16)) * 38 / 100)) as u8;
+    Color32::from_rgb(lift(c.r()), lift(c.g()), lift(c.b()))
 }
 
 fn residue_biophysical_color(res_name: &str, is_ca: bool) -> Color32 {
@@ -558,11 +939,6 @@ fn depth_cue_color(c: Color32, z: f32, max_extent: f32) -> Color32 {
     Color32::from_rgb(scale(c.r()), scale(c.g()), scale(c.b()))
 }
 
-#[inline]
-fn lerp(a: f32, b: f32, t: f32) -> f32 {
-    a + (b - a) * t
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -578,5 +954,45 @@ mod tests {
                 layout.pad_x
             );
         }
+    }
+
+    #[test]
+    fn catmull_rom_spline_scale_bar_and_secondary_structure_helpers() {
+        let p0 = [0.0f32, 0.0, 0.0];
+        let p1 = [1.0, 2.0, 0.0];
+        let p2 = [4.0, 3.0, 1.0];
+        let p3 = [7.0, 1.0, 2.0];
+        assert_eq!(catmull_rom_point(p0, p1, p2, p3, 0.0), p1);
+        let end = catmull_rom_point(p0, p1, p2, p3, 1.0);
+        for d in 0..3 {
+            assert!((end[d] - p2[d]).abs() < 1e-5);
+        }
+        let mid = catmull_rom_point(p0, p1, p2, p3, 0.5);
+        assert!(mid.iter().all(|c| c.is_finite()));
+
+        let (ang, px) = choose_scale_bar_angstrom(14.0);
+        assert!([1.0, 2.0, 5.0, 10.0, 20.0, 50.0].contains(&ang));
+        assert!(px >= 20.0 && px <= 140.0);
+
+        // Ideal alpha-helix C-alpha trace (radius 2.3 A, rise 1.5 A/res, turn 100 deg/res)
+        let (topo, mut coords) =
+            ProteinTopology::build_polypeptide_from_sequence("HELIX10", "AAAAAAAAAA");
+        let ca_indices: Vec<usize> = topo
+            .atoms
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, a)| if a.is_ca { Some(idx) } else { None })
+            .collect();
+        for (k, &ca_idx) in ca_indices.iter().enumerate() {
+            let theta = (k as f32) * (100.0_f32).to_radians();
+            coords[ca_idx] = [2.3 * theta.cos(), 2.3 * theta.sin(), (k as f32) * 1.5];
+        }
+        let ss = classify_secondary_structure(&topo, &coords, &ca_indices);
+        assert_eq!(ss.len(), ca_indices.len());
+        assert!(
+            ss.iter().filter(|&&s| s == SecondaryStructure::Helix).count() >= 4,
+            "Ideal alpha-helix geometry must classify >=4 residues as Helix, got {:?}",
+            ss
+        );
     }
 }

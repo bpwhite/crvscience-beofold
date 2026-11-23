@@ -14,8 +14,9 @@
 // along with this program.  If not, see <https://gnu.org>.
 
 use fold_physics::{
-    run_generation_chunk, try_mremd_swap, verify_checkpoint_sanity, ChaCha8Rng, LangevinConfig,
-    PhysicsError, ProteinTopology, SanityThresholds,
+    rescale_velocities_sugita_okamoto, run_generation_chunk, try_mremd_swap,
+    verify_checkpoint_sanity, ChaCha8Rng, LangevinConfig, PhysicsError, ProteinTopology,
+    SanityThresholds,
 };
 use fold_proto::crypto::verify_signed_result;
 use fold_proto::{
@@ -694,7 +695,24 @@ impl FoldStore {
         }
         write_txn.commit()?;
 
-        let input_cp = self.get_checkpoint(&lease.input_checkpoint_blake3)?;
+        let mut input_cp = self.get_checkpoint(&lease.input_checkpoint_blake3)?;
+        if rec.temperature_kelvin.is_finite()
+            && rec.temperature_kelvin > 0.0
+            && input_cp.temperature_kelvin.is_finite()
+            && input_cp.temperature_kelvin > 0.0
+            && (rec.temperature_kelvin - input_cp.temperature_kelvin).abs() > 1.0e-6
+        {
+            let old_t = input_cp.temperature_kelvin;
+            if rescale_velocities_sugita_okamoto(
+                &mut input_cp.velocities_ang_per_ps,
+                old_t,
+                rec.temperature_kelvin,
+            ) && input_cp.kinetic_energy_kcal.is_finite()
+            {
+                input_cp.kinetic_energy_kcal *= rec.temperature_kelvin / old_t;
+            }
+            input_cp.temperature_kelvin = rec.temperature_kelvin;
+        }
         Ok(Some((lease, input_cp)))
     }
 

@@ -17,6 +17,7 @@ use crate::forcefield::{
     compute_sasa_angstrom2, evaluate_forces_and_energy, evaluate_forces_and_energy_with_gpu,
 };
 use crate::gpu::GpuForceEngine;
+use crate::mremd::rescale_velocities_sugita_okamoto;
 use crate::rng::ChaCha8Rng;
 use crate::sanity::compute_radius_of_gyration;
 use crate::topology::ProteinTopology;
@@ -122,12 +123,22 @@ pub fn initialize_clone_checkpoint(
     let n = topology.atoms.len();
     let mut velocities = vec![[0.0f32; 3]; n];
 
+    let safe_temp = if temperature_kelvin.is_finite() && temperature_kelvin > 0.0 {
+        temperature_kelvin
+    } else {
+        0.0
+    };
+
     let mut total_mass = 0.0f64;
     let mut com_momentum = [0.0f64; 3];
 
     for (i, atom) in topology.atoms.iter().enumerate() {
         let m = atom.mass_amu as f64;
-        let sigma_v = (KCAL_TO_AMU_A2_PS2 * K_BOLTZMANN_KCAL * temperature_kelvin / m).sqrt();
+        if !m.is_finite() || m <= 0.0 {
+            velocities[i] = [0.0, 0.0, 0.0];
+            continue;
+        }
+        let sigma_v = (KCAL_TO_AMU_A2_PS2 * K_BOLTZMANN_KCAL * safe_temp / m).sqrt();
         let g = rng.next_gaussian_vec3();
         let vx = sigma_v * g[0];
         let vy = sigma_v * g[1];
@@ -145,10 +156,13 @@ pub fn initialize_clone_checkpoint(
             (com_momentum[1] / total_mass) as f32,
             (com_momentum[2] / total_mass) as f32,
         ];
-        for v in &mut velocities {
-            v[0] -= v_com[0];
-            v[1] -= v_com[1];
-            v[2] -= v_com[2];
+        for (atom, v) in topology.atoms.iter().zip(velocities.iter_mut()) {
+            let m = atom.mass_amu as f64;
+            if m.is_finite() && m > 0.0 {
+                v[0] -= v_com[0];
+                v[1] -= v_com[1];
+                v[2] -= v_com[2];
+            }
         }
     }
 
@@ -194,15 +208,40 @@ pub fn run_generation_chunk_with_gpu(
     config: &LangevinConfig,
 ) -> GenerationSummary {
     let n = topology.atoms.len();
-    let dt_ps = config.dt_fs * 1.0e-3;
+    let safe_dt_fs = if config.dt_fs.is_finite() && config.dt_fs > 0.0 {
+        config.dt_fs
+    } else {
+        0.0
+    };
+    let safe_friction = if config.friction_per_ps.is_finite() && config.friction_per_ps > 0.0 {
+        config.friction_per_ps
+    } else {
+        0.0
+    };
+    let safe_temp = if config.temperature_kelvin.is_finite() && config.temperature_kelvin > 0.0 {
+        config.temperature_kelvin
+    } else {
+        0.0
+    };
+
+    let dt_ps = safe_dt_fs * 1.0e-3;
     let half_dt = 0.5 * dt_ps;
 
     let mut pos = input.positions_angstrom.clone();
     let mut vel = input.velocities_ang_per_ps.clone();
     let mut rng = ChaCha8Rng::from_raw_parts(input.rng_state, input.rng_counter);
 
-    let use_thermostat = config.friction_per_ps > 0.0;
-    let c1 = (-config.friction_per_ps * dt_ps).exp();
+    let use_thermostat = safe_friction > 0.0;
+    if use_thermostat
+        && input.temperature_kelvin.is_finite()
+        && input.temperature_kelvin > 0.0
+        && safe_temp > 0.0
+        && (safe_temp - input.temperature_kelvin).abs() > 1.0e-6
+    {
+        rescale_velocities_sugita_okamoto(&mut vel, input.temperature_kelvin, safe_temp);
+    }
+
+    let c1 = (-safe_friction * dt_ps).exp();
     let c2 = (1.0 - c1 * c1).max(0.0).sqrt();
 
     let mut forces = vec![[0.0f32; 3]; n];
@@ -218,7 +257,12 @@ pub fn run_generation_chunk_with_gpu(
     for step in 1..=config.steps {
         // B: Half-step velocity kick from F(t)
         for i in 0..n {
-            let inv_m = KCAL_TO_AMU_A2_PS2 / (topology.atoms[i].mass_amu as f64);
+            let m = topology.atoms[i].mass_amu as f64;
+            if !m.is_finite() || m <= 0.0 {
+                vel[i] = [0.0, 0.0, 0.0];
+                continue;
+            }
+            let inv_m = KCAL_TO_AMU_A2_PS2 / m;
             let kick = half_dt * inv_m;
             vel[i][0] = ((vel[i][0] as f64) + kick * (forces[i][0] as f64)) as f32;
             vel[i][1] = ((vel[i][1] as f64) + kick * (forces[i][1] as f64)) as f32;
@@ -236,9 +280,12 @@ pub fn run_generation_chunk_with_gpu(
             // O: Exact Ornstein-Uhlenbeck stochastic velocity update
             for i in 0..n {
                 let m = topology.atoms[i].mass_amu as f64;
-                let sigma = c2
-                    * (KCAL_TO_AMU_A2_PS2 * K_BOLTZMANN_KCAL * config.temperature_kelvin / m)
-                        .sqrt();
+                if !m.is_finite() || m <= 0.0 {
+                    vel[i] = [0.0, 0.0, 0.0];
+                    continue;
+                }
+                let sigma =
+                    c2 * (KCAL_TO_AMU_A2_PS2 * K_BOLTZMANN_KCAL * safe_temp / m).sqrt();
                 let g = rng.next_gaussian_vec3();
                 vel[i][0] = (c1 * (vel[i][0] as f64) + sigma * g[0]) as f32;
                 vel[i][1] = (c1 * (vel[i][1] as f64) + sigma * g[1]) as f32;
@@ -265,7 +312,12 @@ pub fn run_generation_chunk_with_gpu(
 
         // B: Second half-step velocity kick from F(t + dt)
         for i in 0..n {
-            let inv_m = KCAL_TO_AMU_A2_PS2 / (topology.atoms[i].mass_amu as f64);
+            let m = topology.atoms[i].mass_amu as f64;
+            if !m.is_finite() || m <= 0.0 {
+                vel[i] = [0.0, 0.0, 0.0];
+                continue;
+            }
+            let inv_m = KCAL_TO_AMU_A2_PS2 / m;
             let kick = half_dt * inv_m;
             vel[i][0] = ((vel[i][0] as f64) + kick * (forces[i][0] as f64)) as f32;
             vel[i][1] = ((vel[i][1] as f64) + kick * (forces[i][1] as f64)) as f32;
@@ -296,7 +348,7 @@ pub fn run_generation_chunk_with_gpu(
         checkpoint: TrajectoryCheckpoint {
             wu_id: output_wu_id,
             cumulative_steps: input.cumulative_steps + config.steps,
-            temperature_kelvin: config.temperature_kelvin,
+            temperature_kelvin: safe_temp,
             rng_state,
             rng_counter,
             positions_angstrom: pos,
@@ -315,10 +367,14 @@ pub fn run_generation_chunk_with_gpu(
 pub fn compute_kinetic_energy_kcal(topology: &ProteinTopology, velocities: &[[f32; 3]]) -> f64 {
     let mut mv2 = 0.0f64;
     for (atom, v) in topology.atoms.iter().zip(velocities.iter()) {
+        let m = atom.mass_amu as f64;
+        if !m.is_finite() || m <= 0.0 {
+            continue;
+        }
         let vx = v[0] as f64;
         let vy = v[1] as f64;
         let vz = v[2] as f64;
-        mv2 += (atom.mass_amu as f64) * (vx * vx + vy * vy + vz * vz);
+        mv2 += m * (vx * vx + vy * vy + vz * vz);
     }
     0.5 * mv2 / KCAL_TO_AMU_A2_PS2
 }
@@ -385,5 +441,37 @@ mod tests {
             verify_checkpoint_sanity(&topo, &chunk_b.checkpoint, &SanityThresholds::default())
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn integrator_guards_invalid_mass_and_nonpositive_temperature_without_nan() {
+        let (mut topo, mut coords) = ProteinTopology::build_polypeptide_from_sequence("WG", "WG");
+        minimize_steric_clashes(&topo, &mut coords, 10);
+        topo.atoms[0].mass_amu = 0.0;
+        topo.atoms[1].mass_amu = -12.0;
+
+        let cp0 =
+            initialize_clone_checkpoint(&topo, &coords, WorkUnitId::new(1, 0, 0, 0), 0.0, b"guard");
+        assert!(cp0.kinetic_energy_kcal.is_finite());
+        assert_eq!(cp0.velocities_ang_per_ps[0], [0.0, 0.0, 0.0]);
+        assert_eq!(cp0.velocities_ang_per_ps[1], [0.0, 0.0, 0.0]);
+
+        let zero_t_cfg = LangevinConfig {
+            dt_fs: 1.5,
+            friction_per_ps: 1.0,
+            temperature_kelvin: -5.0,
+            steps: 10,
+            sample_stride: 5,
+        };
+        let out = run_generation_chunk(&topo, &cp0, WorkUnitId::new(1, 0, 0, 1), &zero_t_cfg);
+        assert_eq!(out.checkpoint.temperature_kelvin, 0.0);
+        assert!(out.checkpoint.potential_energy_kcal.is_finite());
+        assert!(out.checkpoint.kinetic_energy_kcal.is_finite());
+        for p in &out.checkpoint.positions_angstrom {
+            assert!(p.iter().all(|c| c.is_finite()));
+        }
+        for v in &out.checkpoint.velocities_ang_per_ps {
+            assert!(v.iter().all(|c| c.is_finite()));
+        }
     }
 }

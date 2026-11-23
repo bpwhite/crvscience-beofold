@@ -443,7 +443,7 @@ fn build_or_get_mremd_ensemble() -> &'static MremdEnsembleTelemetry {
         let lag_time_ps = (manifest.steps_per_gen as f64) * manifest.dt_fs / 1000.0;
         let msm = estimate_reversible_msm(&frames, &clustering, 1, lag_time_ps, 300.0, 3)
             .expect("estimate reversible Markov State Model");
-        let pmf = compute_2d_pmf_grid(&frames, &clustering, &msm, 16, 16);
+        let pmf = compute_2d_pmf_grid(&frames, &clustering, &msm, 40, 40);
 
         // Export combined MREMD + MSM folding funnel landscape CSV (< 384 KB)
         let mut csv = String::from(

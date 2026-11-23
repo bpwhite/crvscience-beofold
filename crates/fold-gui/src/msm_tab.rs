@@ -22,8 +22,8 @@ use egui::{
 };
 use fold_msm::{
     cluster_conformations_kmedoids, compute_2d_pmf_grid, compute_pairwise_rmsd_matrix,
-    estimate_reversible_msm, export_msm_bundle, extract_project_frames, ConformationalFrame,
-    MicrostateClustering, PmfGrid2D, ReversibleMsmModel,
+    estimate_reversible_msm, export_msm_bundle, extract_pmf_iso_contours, extract_project_frames,
+    ConformationalFrame, MicrostateClustering, PmfGrid2D, ReversibleMsmModel,
 };
 use fold_physics::{compute_ca_rmsd, ProteinTopology};
 use fold_proto::ProjectManifest;
@@ -103,6 +103,14 @@ impl Default for MsmLandscapeTab {
 }
 
 impl MsmLandscapeTab {
+    pub fn reset_preview_camera(&mut self) {
+        self.preview_viewport.reset_camera();
+    }
+
+    pub fn toggle_preview_auto_spin(&mut self) {
+        self.preview_viewport.auto_spin = !self.preview_viewport.auto_spin;
+    }
+
     pub fn is_animating(&self) -> bool {
         let busy = self
             .job_slot
@@ -368,7 +376,7 @@ impl MsmLandscapeTab {
                             .text("Microstates (K)"),
                     )
                     .on_hover_text(
-                        "Number of Kabsch C-alpha RMSD k-medoids conformational microstates (4..=18).",
+                        "Number of Kabsch C-alpha RMSD k-medoids conformational microstates (K = 4..=18). Higher K resolves finer kinetic intermediates; requires >= 2K trajectory frames.",
                     );
                     self.num_macrostates = self.num_macrostates.min(self.num_microstates);
                     let max_macro = self.num_microstates.min(5).max(2);
@@ -377,14 +385,14 @@ impl MsmLandscapeTab {
                             .text("PCCA+ Macrostates (M)"),
                     )
                     .on_hover_text(
-                        "Number of metastable PCCA+ macrostates coarse-grained from K microstates (M <= K).",
+                        "Number of metastable PCCA+ macrostates coarse-grained from K microstates (M <= K). Groups fast-mixing microstates into slow folded, intermediate, and unfolded basins.",
                     );
                     ui.add(
                         egui::Slider::new(&mut self.lag_generations, 1..=4)
                             .text("Lag (Generations)"),
                     )
                     .on_hover_text(
-                        "Markov transition lag time tau measured in MREMD checkpoint generations.",
+                        "Markov transition lag time tau measured in MREMD checkpoint generations (1..=4). Larger lag improves Markovianity at the cost of fewer transition counts.",
                     );
                     ui.add(
                         egui::Slider::new(&mut self.ref_temp_kelvin, 275.0..=380.0)
@@ -463,7 +471,7 @@ impl MsmLandscapeTab {
                                 .text("Min Flux (pi_i * T_ij)"),
                         )
                         .on_hover_text(
-                            "Minimum equilibrium probability flux (pi_i * T_ij) required to draw a transition edge.",
+                            "Minimum equilibrium probability flux (pi_i * T_ij) required to render a transition arrow on the 2D landscape (0.001..=0.05). Lower values reveal minor folding pathways.",
                         );
                     }
 
@@ -570,144 +578,160 @@ impl MsmLandscapeTab {
             .resizable(true)
             .default_width(410.0)
             .show(ctx, |ui| {
-                if let Some(ref bundle) = self.active_bundle {
-                    let frame_idx = self
-                        .selected_frame_idx
-                        .unwrap_or(0)
-                        .min(bundle.frames.len().saturating_sub(1));
-                    let sel_frame = &bundle.frames[frame_idx];
-                    let orig_micro_id = bundle.clustering.frame_assignments[frame_idx];
-                    let active_micro_opt = bundle
-                        .msm
-                        .orig_to_active
-                        .get(orig_micro_id)
-                        .copied()
-                        .flatten();
-                    let active_micro_label = active_micro_opt
-                        .map(|a| format!("S{}", a))
-                        .unwrap_or_else(|| format!("S_orig{}", orig_micro_id));
-                    let macro_id = active_micro_opt
-                        .map(|a| bundle.msm.microstate_to_macrostate[a])
-                        .unwrap_or(0);
-                    let p_fold_val = active_micro_opt
-                        .map(|a| bundle.msm.folding_committor[a])
-                        .unwrap_or(0.0);
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    if let Some(ref bundle) = self.active_bundle {
+                        let frame_idx = self
+                            .selected_frame_idx
+                            .unwrap_or(0)
+                            .min(bundle.frames.len().saturating_sub(1));
+                        let sel_frame = &bundle.frames[frame_idx];
+                        let orig_micro_id = bundle.clustering.frame_assignments[frame_idx];
+                        let active_micro_opt = bundle
+                            .msm
+                            .orig_to_active
+                            .get(orig_micro_id)
+                            .copied()
+                            .flatten();
+                        let active_micro_label = active_micro_opt
+                            .map(|a| format!("S{}", a))
+                            .unwrap_or_else(|| format!("S_orig{}", orig_micro_id));
+                        let macro_id = active_micro_opt
+                            .map(|a| bundle.msm.microstate_to_macrostate[a])
+                            .unwrap_or(0);
+                        let p_fold_val = active_micro_opt
+                            .map(|a| bundle.msm.folding_committor[a])
+                            .unwrap_or(0.0);
 
-                    ui.horizontal(|ui| {
-                        ui.heading(format!(
-                            "3D Inspector — M{} / {}",
-                            macro_id, active_micro_label
-                        ));
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.horizontal(|ui| {
+                            ui.heading(format!(
+                                "3D Inspector — M{} / {}",
+                                macro_id, active_micro_label
+                            ));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui
+                                    .button(RichText::new("Open in Full 3D Studio").strong())
+                                    .clicked()
+                                {
+                                    jump_to_3d_studio = true;
+                                }
+                            });
+                        });
+
+                        ui.label(
+                            RichText::new(format!(
+                                "WU {} | V_pot={:.2} kcal/mol | Rg={:.2} A | p_fold={:.2}",
+                                sel_frame.wu_id,
+                                sel_frame.potential_energy_kcal,
+                                sel_frame.rg_angstrom,
+                                p_fold_val
+                            ))
+                            .monospace()
+                            .size(11.0)
+                            .color(Color32::from_rgb(56, 189, 248)),
+                        );
+
+                        ui.horizontal(|ui| {
+                            ui.checkbox(&mut self.preview_viewport.auto_spin, "Auto-Spin")
+                                .on_hover_text("Toggle 3D preview rotation (S)");
                             if ui
-                                .button(RichText::new("Open in Full 3D Studio").strong())
+                                .button("Reset Cam")
+                                .on_hover_text("Reset 3D preview camera (R)")
                                 .clicked()
                             {
-                                jump_to_3d_studio = true;
+                                self.preview_viewport.reset_camera();
                             }
-                        });
-                    });
-
-                    ui.label(
-                        RichText::new(format!(
-                            "WU {} | V_pot={:.2} kcal/mol | Rg={:.2} A | p_fold={:.2}",
-                            sel_frame.wu_id,
-                            sel_frame.potential_energy_kcal,
-                            sel_frame.rg_angstrom,
-                            p_fold_val
-                        ))
-                        .monospace()
-                        .size(11.0)
-                        .color(Color32::from_rgb(56, 189, 248)),
-                    );
-
-                    ui.horizontal(|ui| {
-                        ui.checkbox(&mut self.preview_viewport.auto_spin, "Auto-Spin");
-                        if ui.button("Save .pdb...").clicked() {
-                            let default_name = PathBuf::from(self.single_pdb_out.trim())
-                                .file_name()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or("selected_state.pdb")
-                                .to_string();
-                            if let Some(p) = rfd::FileDialog::new()
-                                .add_filter("PDB Structure", &["pdb"])
-                                .set_file_name(&default_name)
-                                .save_file()
-                            {
-                                self.single_pdb_out = p.display().to_string();
-                                match bundle.topology.write_pdb_snapshot(
-                                    &sel_frame.positions_angstrom,
-                                    &p,
-                                    &format!("MSM Selected M{} {}", macro_id, active_micro_label),
-                                    sel_frame.potential_energy_kcal,
-                                ) {
-                                    Ok(()) => {
-                                        self.status_note = Some(format!(
-                                            "Wrote 3D conformation to {}",
-                                            p.display()
-                                        ));
-                                    }
-                                    Err(e) => {
-                                        self.status_note = Some(format!("PDB save error: {}", e));
+                            if ui.button("Save .pdb...").clicked() {
+                                let default_name = PathBuf::from(self.single_pdb_out.trim())
+                                    .file_name()
+                                    .and_then(|s| s.to_str())
+                                    .unwrap_or("selected_state.pdb")
+                                    .to_string();
+                                if let Some(p) = rfd::FileDialog::new()
+                                    .add_filter("PDB Structure", &["pdb"])
+                                    .set_file_name(&default_name)
+                                    .save_file()
+                                {
+                                    self.single_pdb_out = p.display().to_string();
+                                    match bundle.topology.write_pdb_snapshot(
+                                        &sel_frame.positions_angstrom,
+                                        &p,
+                                        &format!(
+                                            "MSM Selected M{} {}",
+                                            macro_id, active_micro_label
+                                        ),
+                                        sel_frame.potential_energy_kcal,
+                                    ) {
+                                        Ok(()) => {
+                                            self.status_note = Some(format!(
+                                                "Wrote 3D conformation to {}",
+                                                p.display()
+                                            ));
+                                        }
+                                        Err(e) => {
+                                            self.status_note =
+                                                Some(format!("PDB save error: {}", e));
+                                        }
                                     }
                                 }
                             }
-                        }
-                    });
+                        });
 
-                    // Allocate top ~58% height to the interactive 3D Conformation Viewport
-                    let top_h = (ui.available_height() * 0.56).max(220.0);
-                    ui.allocate_ui(Vec2::new(ui.available_width(), top_h), |ui| {
-                        self.preview_viewport.ui(
-                            ui,
-                            &bundle.topology,
-                            &sel_frame.positions_angstrom,
-                            &format!("M{} / {}", macro_id, active_micro_label),
+                        // Allocate top ~52% height (min 220 px) to the interactive 3D Conformation Viewport
+                        let top_h = (ui.available_height() * 0.52).clamp(220.0, 440.0);
+                        ui.allocate_ui(Vec2::new(ui.available_width(), top_h), |ui| {
+                            self.preview_viewport.ui(
+                                ui,
+                                &bundle.topology,
+                                &sel_frame.positions_angstrom,
+                                &format!("M{} / {}", macro_id, active_micro_label),
+                            );
+                        });
+
+                        ui.separator();
+                        ui.heading("Implied Timescales & Reversibility");
+                        ui.label(
+                            RichText::new(format!(
+                                "Transitions: {} | Detailed-balance err: {:.2e}",
+                                bundle.msm.total_transitions, bundle.msm.detailed_balance_max_error
+                            ))
+                            .monospace()
+                            .size(11.0),
                         );
-                    });
+                        ui.add_space(4.0);
 
-                    ui.separator();
-                    ui.heading("Implied Timescales & Reversibility");
-                    ui.label(
-                        RichText::new(format!(
-                            "Transitions: {} | Detailed-balance err: {:.2e}",
-                            bundle.msm.total_transitions, bundle.msm.detailed_balance_max_error
-                        ))
-                        .monospace()
-                        .size(11.0),
-                    );
-                    ui.add_space(4.0);
-
-                    let max_its = bundle
-                        .msm
-                        .implied_timescales_ps
-                        .iter()
-                        .take(5)
-                        .cloned()
-                        .fold(1.0f64, f64::max);
-                    for (idx, &its) in bundle.msm.implied_timescales_ps.iter().take(5).enumerate() {
-                        let lam = bundle
+                        let max_its = bundle
                             .msm
-                            .eigenvalues
-                            .get(idx + 1)
-                            .copied()
-                            .unwrap_or(0.0);
-                        let frac = ((its / max_its) as f32).clamp(0.02, 1.0);
-                        ui.add(egui::ProgressBar::new(frac).text(format!(
-                            "t_{} = {:.2} ps  (lambda_{} = {:.4})",
-                            idx + 2,
-                            its,
-                            idx + 2,
-                            lam
-                        )));
+                            .implied_timescales_ps
+                            .iter()
+                            .take(5)
+                            .cloned()
+                            .fold(1.0f64, f64::max);
+                        for (idx, &its) in
+                            bundle.msm.implied_timescales_ps.iter().take(5).enumerate()
+                        {
+                            let lam = bundle
+                                .msm
+                                .eigenvalues
+                                .get(idx + 1)
+                                .copied()
+                                .unwrap_or(0.0);
+                            let frac = ((its / max_its) as f32).clamp(0.02, 1.0);
+                            ui.add(egui::ProgressBar::new(frac).text(format!(
+                                "t_{} = {:.2} ps  (lambda_{} = {:.4})",
+                                idx + 2,
+                                its,
+                                idx + 2,
+                                lam
+                            )));
+                        }
+                    } else {
+                        ui.heading("3D Macrostate Conformation Inspector");
+                        ui.add_space(8.0);
+                        ui.label(
+                            "Build an MSM using the left panel ('Compute MSM from Live Studio' or 'Build from redb') to inspect the 2D (RMSD, Rg) free-energy landscape and click metastable macrostates.",
+                        );
                     }
-                } else {
-                    ui.heading("3D Macrostate Conformation Inspector");
-                    ui.add_space(8.0);
-                    ui.label(
-                        "Build an MSM using the left panel ('Compute MSM from Live Studio' or 'Build from redb') to inspect the 2D (RMSD, Rg) free-energy landscape and click metastable macrostates.",
-                    );
-                }
+                });
             });
 
         // 3. Center Panel: Interactive 2D (C-alpha RMSD, R_g) Free-Energy Surface + Markov Flux Network
@@ -858,6 +882,49 @@ fn draw_interactive_pmf_and_flux_canvas(
     };
 
     let plot_painter = painter.with_clip_rect(plot_rect);
+
+    // 1B. Render iso-energy contour lines (1, 2, 3 kcal/mol) via Marching Squares
+    let contours = extract_pmf_iso_contours(grid, &[1.0, 2.0, 3.0]);
+    for c_lvl in &contours {
+        let (col, width) = if (c_lvl.level_kcal - 1.0).abs() < 0.1 {
+            (
+                Color32::from_rgba_unmultiplied(248, 250, 252, 195),
+                1.35_f32,
+            )
+        } else if (c_lvl.level_kcal - 2.0).abs() < 0.1 {
+            (
+                Color32::from_rgba_unmultiplied(186, 230, 253, 150),
+                1.10_f32,
+            )
+        } else {
+            (
+                Color32::from_rgba_unmultiplied(148, 163, 184, 120),
+                0.95_f32,
+            )
+        };
+        for &(p0, p1) in &c_lvl.segments {
+            let s0 = map_xy(p0[0], p0[1]);
+            let s1 = map_xy(p1[0], p1[1]);
+            plot_painter.line_segment([s0, s1], Stroke::new(width, col));
+        }
+    }
+
+    // Colorbar contour markers (1, 2, 3 kcal/mol)
+    for lvl in [1.0f64, 2.0, 3.0] {
+        let frac = (lvl / grid.max_capped_kcal.max(0.1)).clamp(0.0, 1.0) as f32;
+        let cy = plot_rect.bottom() - frac * plot_rect.height();
+        painter.line_segment(
+            [Pos2::new(cb_x0, cy), Pos2::new(cb_x0 + cb_w, cy)],
+            Stroke::new(1.1_f32, Color32::from_rgba_unmultiplied(248, 250, 252, 200)),
+        );
+        painter.text(
+            Pos2::new(cb_x0 + cb_w + 4.0, cy),
+            Align2::LEFT_CENTER,
+            format!("{:.0}", lvl),
+            FontId::monospace(9.0),
+            Color32::from_rgb(186, 200, 220),
+        );
+    }
 
     // 2. Equilibrium Markov Flux Network (`pi_i * T_ij` directed from lower -> higher committor `p_fold`)
     if show_flux {
@@ -1186,7 +1253,7 @@ fn build_msm_from_live_frames(
     )
     .map_err(|e| e.to_string())?;
 
-    let pmf_grid = compute_2d_pmf_grid(&frames, &clustering, &msm, 28, 28);
+    let pmf_grid = compute_2d_pmf_grid(&frames, &clustering, &msm, 40, 40);
     let manifest = ProjectManifest {
         project_id: 1,
         name: topology.name.clone(),
@@ -1255,7 +1322,7 @@ fn build_msm_from_redb_vault(
     )
     .map_err(|e| e.to_string())?;
 
-    let pmf_grid = compute_2d_pmf_grid(&frames, &clustering, &msm, 28, 28);
+    let pmf_grid = compute_2d_pmf_grid(&frames, &clustering, &msm, 40, 40);
 
     Ok(ComputedMsmBundle {
         source_label: format!("Vault {} ({} frames)", vault_dir.display(), frames.len()),
@@ -1300,5 +1367,45 @@ mod tests {
             tab.num_microstates
         );
         assert_eq!(tab.num_macrostates, 4);
+    }
+
+    #[test]
+    fn msm_right_inspector_scrolls_on_short_viewport_with_active_bundle() {
+        let ctx = egui::Context::default();
+        let mut tab = MsmLandscapeTab::default();
+        let mut live = LiveFoldingState::new_preset(TargetPreset::TrpCage1L2Y, false);
+
+        // Create 12 distinct conformations so MSM estimation + 40x40 PMF succeeds
+        let base = live.msm_frames[0].clone();
+        live.msm_frames.clear();
+        for run in 0..2u32 {
+            for step in 0..6u32 {
+                let mut f = base.clone();
+                f.wu_id = fold_proto::WorkUnitId::new(1, run, 0, step);
+                f.chain_step = step;
+                f.temperature_kelvin = 290.0;
+                f.potential_energy_kcal = -20.0 + (step as f64) * 1.5;
+                f.rg_angstrom = 9.0 + (step as f64) * 0.4;
+                for (ai, p) in f.positions_angstrom.iter_mut().enumerate() {
+                    p[0] += ((step as f32) - 2.5).abs() * 0.25 + (ai as f32) * 0.02 * (run as f32);
+                }
+                live.msm_frames.push_back(f);
+            }
+        }
+        let (tx, _rx) = mpsc::channel();
+        tab.compute_live_msm_blocking(&live, &tx)
+            .expect("compute live MSM bundle");
+        assert!(tab.active_bundle.is_some());
+
+        let mut vault_dir = String::from("./beofold_data");
+        let mut raw = egui::RawInput::default();
+        raw.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(1024.0, 420.0),
+        ));
+        let out = ctx.run(raw, |c| {
+            let _ = tab.render(c, &live, &mut vault_dir, &tx);
+        });
+        assert!(!out.shapes.is_empty());
     }
 }
