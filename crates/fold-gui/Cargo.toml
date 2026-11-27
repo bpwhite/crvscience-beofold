@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "BeoFold desktop Supervisor Workstation (eframe/egui) for LAN Beowulf cluster control, Apache WAN federation telemetry, Markov State Model free-energy surfaces, and interactive 3D protein conformation viewing"
+homepage.workspace = true
+repository.workspace = true
 
 [[bin]]
 name = "fold-gui"

@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Apache HTTP web synchronizing server (axum mod_proxy daemon + zero-daemon mod_cgid CGI mode) for BeoFold"
+homepage.workspace = true
+repository.workspace = true
 
 [lib]
 name = "fold_sync"

@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Headless Beowulf compute node, LAN Raft/QUIC auto-clustering mesh, and outbound Apache WAN gateway for BeoFold"
+homepage.workspace = true
+repository.workspace = true
 
 [[bin]]
 name = "fold-node"

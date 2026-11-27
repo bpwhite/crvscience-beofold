@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Pure-Rust Markov State Model (MSM) C-alpha RMSD microstate clusterer, reversible detailed-balance MLE, Jacobi eigensolver, PCCA+ coarse-grainer, and free-energy landscape exporter"
+homepage.workspace = true
+repository.workspace = true
 
 [[bin]]
 name = "fold-msm"
