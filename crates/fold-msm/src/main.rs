@@ -18,7 +18,7 @@
 use clap::{Parser, Subcommand};
 use fold_msm::{
     cluster_conformations_kmedoids, compute_pairwise_rmsd_matrix, estimate_reversible_msm,
-    export_msm_bundle, extract_project_frames,
+    export_msm_bundle, export_msm_diagnostics, extract_project_frames,
 };
 use fold_physics::{
     initialize_clone_checkpoint, minimize_steric_clashes, run_generation_chunk, ChaCha8Rng,
@@ -233,12 +233,22 @@ fn run_analysis_pipeline(
     }
 
     let exported = export_msm_bundle(out_dir, &manifest, &topology, &frames, &clustering, &msm)?;
+    let (diag_json, diag_csv, diag) =
+        export_msm_diagnostics(out_dir, &frames, &clustering, &msm, 4, max_temp)?;
     println!("-------------------------------------------------------------------------");
     println!(" Exported MSM Landscape & Structural Bundle:");
     println!("   JSON Report      : {}", exported.json_report_path.display());
     println!("   Microstate CSV   : {}", exported.microstate_csv_path.display());
     println!("   2D PMF Grid CSV  : {}", exported.pmf_grid_csv_path.display());
     println!("   Landscape SVG    : {}", exported.svg_landscape_path.display());
+    println!(
+        "   ITS/CK JSON      : {} (CK max_err={:.4}, RMSE={:.4}, pass={})",
+        diag_json.display(),
+        diag.ck_max_abs_error,
+        diag.ck_rmse,
+        diag.markovian_pass
+    );
+    println!("   ITS/CK CSV       : {}", diag_csv.display());
     for pdb in &exported.macrostate_pdb_paths {
         println!("   Macrostate PDB   : {}", pdb.display());
     }

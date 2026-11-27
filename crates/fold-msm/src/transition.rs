@@ -448,7 +448,9 @@ fn tarjan_largest_scc(counts: &[Vec<u64>]) -> Vec<usize> {
                 strongconnect(w, counts, st);
                 st.lowlink[v] = st.lowlink[v].min(st.lowlink[w]);
             } else if st.on_stack[w] {
-                st.lowlink[v] = st.lowlink[v].min(st.indices[w].unwrap());
+                if let Some(w_idx) = st.indices[w] {
+                    st.lowlink[v] = st.lowlink[v].min(w_idx);
+                }
             }
         }
 

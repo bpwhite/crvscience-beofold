@@ -22,8 +22,9 @@ use egui::{
 };
 use fold_msm::{
     cluster_conformations_kmedoids, compute_2d_pmf_grid, compute_pairwise_rmsd_matrix,
-    estimate_reversible_msm, export_msm_bundle, extract_pmf_iso_contours, extract_project_frames,
-    ConformationalFrame, MicrostateClustering, PmfGrid2D, ReversibleMsmModel,
+    estimate_reversible_msm, export_msm_bundle, export_msm_diagnostics, extract_pmf_iso_contours,
+    extract_project_frames, ConformationalFrame, MicrostateClustering, PmfGrid2D,
+    ReversibleMsmModel,
 };
 use fold_physics::{compute_ca_rmsd, ProteinTopology};
 use fold_proto::ProjectManifest;
@@ -120,7 +121,7 @@ impl MsmLandscapeTab {
         busy || (self.active_bundle.is_some() && self.preview_viewport.auto_spin)
     }
 
-    fn spawn_live_ensemble_msm(&mut self, live: &LiveFoldingState) {
+    pub(crate) fn spawn_live_ensemble_msm(&mut self, live: &LiveFoldingState) {
         let raw_frames: Vec<ConformationalFrame> = live.msm_frames.iter().cloned().collect();
         if raw_frames.len() < 8 {
             self.status_note = Some(format!(
@@ -206,6 +207,77 @@ impl MsmLandscapeTab {
         self.active_bundle = Some(bundle);
         self.select_macrostate_and_sync(0, sandbox_tx);
         Ok(())
+    }
+
+    pub(crate) fn export_active_bundle(&mut self) {
+        let Some(ref bundle) = self.active_bundle else {
+            self.status_note = Some(
+                "No active MSM computed yet. Run 'Compute MSM from Live Studio' first.".to_string(),
+            );
+            return;
+        };
+        match non_empty_trimmed_path(&self.export_bundle_dir) {
+            Ok(out) => match export_msm_bundle(
+                &out,
+                &bundle.manifest,
+                &bundle.topology,
+                &bundle.frames,
+                &bundle.clustering,
+                &bundle.msm,
+            ) {
+                Ok(art) => {
+                    self.status_note = Some(format!(
+                        "Exported SVG, JSON, CSVs & {} macrostate PDBs to {}",
+                        art.macrostate_pdb_paths.len(),
+                        out.display()
+                    ));
+                }
+                Err(e) => {
+                    self.status_note = Some(format!("Export error: {}", e));
+                }
+            },
+            Err(msg) => self.status_note = Some(msg),
+        }
+    }
+
+    pub(crate) fn export_active_diagnostics(&mut self) {
+        let Some(ref bundle) = self.active_bundle else {
+            self.status_note = Some(
+                "No active MSM computed yet. Run 'Compute MSM from Live Studio' first.".to_string(),
+            );
+            return;
+        };
+        match non_empty_trimmed_path(&self.export_bundle_dir) {
+            Ok(out) => {
+                let max_t = if self.cold_rung_filter_only {
+                    Some(self.ref_temp_kelvin + 25.0)
+                } else {
+                    None
+                };
+                match export_msm_diagnostics(
+                    &out,
+                    &bundle.frames,
+                    &bundle.clustering,
+                    &bundle.msm,
+                    4,
+                    max_t,
+                ) {
+                    Ok((_, _, diag)) => {
+                        self.status_note = Some(format!(
+                            "Exported ITS/CK JSON & CSV to {} (CK max_err={:.4}, RMSE={:.4}, pass={})",
+                            out.display(),
+                            diag.ck_max_abs_error,
+                            diag.ck_rmse,
+                            diag.markovian_pass
+                        ));
+                    }
+                    Err(e) => {
+                        self.status_note = Some(format!("Export error: {}", e));
+                    }
+                }
+            }
+            Err(msg) => self.status_note = Some(msg),
+        }
     }
 
     fn spawn_vault_msm(&mut self, vault_dir: PathBuf) {
@@ -535,28 +607,16 @@ impl MsmLandscapeTab {
                                 }
                             }
                             if ui.button("Export All").clicked() {
-                                match non_empty_trimmed_path(&self.export_bundle_dir) {
-                                    Ok(out) => match export_msm_bundle(
-                                        &out,
-                                        &bundle_clone.manifest,
-                                        &bundle_clone.topology,
-                                        &bundle_clone.frames,
-                                        &bundle_clone.clustering,
-                                        &bundle_clone.msm,
-                                    ) {
-                                        Ok(art) => {
-                                            self.status_note = Some(format!(
-                                                "Exported SVG, JSON, CSVs & {} macrostate PDBs to {}",
-                                                art.macrostate_pdb_paths.len(),
-                                                out.display()
-                                            ));
-                                        }
-                                        Err(e) => {
-                                            self.status_note = Some(format!("Export error: {}", e));
-                                        }
-                                    },
-                                    Err(msg) => self.status_note = Some(msg),
-                                }
+                                self.export_active_bundle();
+                            }
+                            if ui
+                                .button("Export ITS/CK")
+                                .on_hover_text(
+                                    "Export Implied Timescales (ITS) & Chapman-Kolmogorov (CK) diagnostic digest as JSON & CSV.",
+                                )
+                                .clicked()
+                            {
+                                self.export_active_diagnostics();
                             }
                         });
                     }

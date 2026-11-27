@@ -16,12 +16,18 @@
 #![forbid(unsafe_code)]
 
 pub mod clustering;
+pub mod diagnostics;
 pub mod landscape;
 pub mod transition;
 
 pub use clustering::{
     cluster_conformations_kmedoids, compute_pairwise_rmsd_matrix, extract_project_frames,
     ConformationalFrame, MicrostateClustering, MsmError,
+};
+pub use diagnostics::{
+    compute_msm_diagnostics, export_msm_diagnostics, format_msm_diagnostics_csv,
+    format_msm_diagnostics_json, ChapmanKolmogorovEntry, ImpliedTimescalePoint,
+    MsmDiagnosticDigest,
 };
 pub use landscape::{
     compute_2d_pmf_grid, export_msm_bundle, extract_pmf_iso_contours, ExportedMsmArtifacts,

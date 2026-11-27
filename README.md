@@ -32,6 +32,7 @@ All global keyboard shortcuts are guarded by `!ctx.wants_keyboard_input()` so ty
 | `R` | Global | Reset 3D camera (`yaw`, `pitch`, `zoom`, `pan`) in active 3D viewport |
 | `S` | Global | Toggle 3D viewport `Auto-Spin` |
 | `1` – `4` | Global | Switch workspace tabs (`1` Studio, `2` LAN Matrix, `3` WAN Federation, `4` MSM Surface) |
+| `Ctrl+K` / `Cmd+K` | Global | Open fuzzy **Command Palette** modal (switch views, compute/export MSM & ITS/CK diagnostics, discover LAN peers, reset camera) |
 | `F1` / `Esc` | Global | Toggle / Dismiss the **About BeoFold** dialog |
 | Primary Drag | 3D Viewport | Orbit protein conformation |
 | Secondary / Middle Drag | 3D Viewport | Pan 3D camera |
@@ -92,6 +93,8 @@ Generated deterministically by `cargo test -p fold-msm --test headless_validatio
 | `t2` 4-Rung MREMD (`[285, 320, 360, 405 K]`, `64` WUs, `72` frames) | Pair swap acceptance `21/54` (`mean P_acc = 0.4085`), `store_mremd_swaps = 8/32`, `Q in [0.6000, 1.0000]` |
 | `t3` Reversible MSM (`lag = 0.4000 ps`, `K = 6` active states, `M = 3` PCCA+) | Detailed-balance error `2.65e-23`, row-stochastic error `0.00e0`, stationary sum `1.000000` |
 | `t3` 2D PMF Surface & Contours | `40x40` adaptive-KDE grid with `1, 2, 3 kcal/mol` iso-contours |
+| `fold-msm` ITS & Chapman-Kolmogorov | Multi-lag Implied Timescales (`ITS`) & macrostate Chapman-Kolmogorov (`CK`) diagnostic digest exported to `msm_diagnostics.json` & `msm_diagnostics.csv` via CLI (`fold-msm analyze` / `demo-analyze`) and GUI (`Export ITS/CK`) |
+| Workspace Release Test Suite | `55 passed; 0 failed` across all 7 workspace crates (`fold-gui` 16, `fold-msm` 7 + 3 validation, `fold-node` 1, `fold-physics` 17, `fold-proto` 6, `fold-storage` 2, `fold-sync` 3) with `0` non-test `.unwrap()` calls |
 
 ## Documentation & Guides
 

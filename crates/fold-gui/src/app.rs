@@ -45,6 +45,169 @@ enum WorkspaceTab {
     MsmFreeEnergyFlux,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaletteAction {
+    TabStudio3D,
+    TabLanMatrix,
+    TabWanFederation,
+    TabMsmSurface,
+    TogglePlayPause,
+    ResetCamera,
+    ToggleAutoSpin,
+    ToggleClusterBar,
+    DiscoverLanPeers,
+    ComputeLiveMsm,
+    ExportBestPdb,
+    ExportMsmBundle,
+    ExportMsmDiagnostics,
+    ToggleAbout,
+}
+
+struct PaletteCommand {
+    label: &'static str,
+    category: &'static str,
+    hotkey: &'static str,
+    keywords: &'static str,
+    action: PaletteAction,
+}
+
+const PALETTE_COMMANDS: &[PaletteCommand] = &[
+    PaletteCommand {
+        label: "Switch to 3D Conformation & MREMD Studio",
+        category: "View",
+        hotkey: "1",
+        keywords: "folding 3d studio conformation mremd view tab",
+        action: PaletteAction::TabStudio3D,
+    },
+    PaletteCommand {
+        label: "Switch to LAN Beowulf Cluster Matrix",
+        category: "Cluster",
+        hotkey: "2",
+        keywords: "lan beowulf cluster matrix peers nodes status tab",
+        action: PaletteAction::TabLanMatrix,
+    },
+    PaletteCommand {
+        label: "Switch to Apache WAN Federation",
+        category: "Cluster",
+        hotkey: "3",
+        keywords: "wan apache federation clusters global status tab",
+        action: PaletteAction::TabWanFederation,
+    },
+    PaletteCommand {
+        label: "Switch to MSM Free-Energy & Flux Surface",
+        category: "MSM",
+        hotkey: "4",
+        keywords: "msm markov state model pmf free energy flux landscape tab",
+        action: PaletteAction::TabMsmSurface,
+    },
+    PaletteCommand {
+        label: "Play / Pause Live MREMD Folding Runner",
+        category: "Simulation",
+        hotkey: "Space",
+        keywords: "play pause start stop run mremd folding",
+        action: PaletteAction::TogglePlayPause,
+    },
+    PaletteCommand {
+        label: "Reset 3D Camera (Studio & MSM Preview)",
+        category: "Viewport",
+        hotkey: "R",
+        keywords: "camera reset zoom yaw pitch pan center",
+        action: PaletteAction::ResetCamera,
+    },
+    PaletteCommand {
+        label: "Toggle 3D Viewport Auto-Spin",
+        category: "Viewport",
+        hotkey: "S",
+        keywords: "spin rotate auto viewport",
+        action: PaletteAction::ToggleAutoSpin,
+    },
+    PaletteCommand {
+        label: "Toggle Cluster Connection Bar",
+        category: "Cluster",
+        hotkey: "",
+        keywords: "cluster connection peer secret sync url bar",
+        action: PaletteAction::ToggleClusterBar,
+    },
+    PaletteCommand {
+        label: "Discover LAN Beowulf Peers (mDNS Scan)",
+        category: "Cluster",
+        hotkey: "",
+        keywords: "discover mdns scan lan peers cluster status",
+        action: PaletteAction::DiscoverLanPeers,
+    },
+    PaletteCommand {
+        label: "Compute MSM from Live Studio Frames",
+        category: "MSM",
+        hotkey: "",
+        keywords: "compute build msm markov pcca live frames",
+        action: PaletteAction::ComputeLiveMsm,
+    },
+    PaletteCommand {
+        label: "Export Best Folded Conformation (.pdb)",
+        category: "Export",
+        hotkey: "",
+        keywords: "export save pdb structure conformation",
+        action: PaletteAction::ExportBestPdb,
+    },
+    PaletteCommand {
+        label: "Export MSM Landscape & Macrostate PDB Bundle",
+        category: "Export",
+        hotkey: "",
+        keywords: "export msm bundle svg csv json pdb pmf",
+        action: PaletteAction::ExportMsmBundle,
+    },
+    PaletteCommand {
+        label: "Export MSM ITS & Chapman-Kolmogorov Diagnostics (JSON/CSV)",
+        category: "Export",
+        hotkey: "",
+        keywords: "export msm diagnostics implied timescales its chapman kolmogorov ck json csv",
+        action: PaletteAction::ExportMsmDiagnostics,
+    },
+    PaletteCommand {
+        label: "Toggle About BeoFold Dialog",
+        category: "Help",
+        hotkey: "F1",
+        keywords: "about help version license citation",
+        action: PaletteAction::ToggleAbout,
+    },
+];
+
+pub(crate) fn fuzzy_palette_score(query: &str, label: &str, keywords: &str) -> Option<i32> {
+    let q = query.trim().to_ascii_lowercase();
+    if q.is_empty() {
+        return Some(1000);
+    }
+    let hay = format!("{} {}", label, keywords).to_ascii_lowercase();
+    if let Some(pos) = label.to_ascii_lowercase().find(&q) {
+        return Some(800 - (pos as i32) * 2);
+    }
+    if let Some(pos) = hay.find(&q) {
+        return Some(500 - (pos as i32));
+    }
+    let mut score = 200_i32;
+    let mut hay_iter = hay.chars().peekable();
+    let mut consecutive = 0_i32;
+    for qch in q.chars() {
+        if qch.is_whitespace() {
+            continue;
+        }
+        let mut matched = false;
+        while let Some(hch) = hay_iter.next() {
+            if hch == qch {
+                score += 12 + consecutive * 6;
+                consecutive += 1;
+                matched = true;
+                break;
+            }
+            consecutive = 0;
+        }
+        if !matched {
+            return None;
+        }
+    }
+    Some(score)
+}
+
 pub(crate) fn classify_status_color(msg: &str, default_color: Color32) -> Color32 {
     let lower = msg.to_ascii_lowercase();
     if lower.contains("error") || lower.contains("failed") {
@@ -116,6 +279,10 @@ pub struct BeoFoldGuiApp {
     msm_tab: MsmLandscapeTab,
     last_export_msg: Option<String>,
     show_about: bool,
+    show_command_palette: bool,
+    command_palette_query: String,
+    command_palette_selected: usize,
+    focus_command_palette: bool,
 }
 
 impl BeoFoldGuiApp {
@@ -183,6 +350,10 @@ impl BeoFoldGuiApp {
             msm_tab: MsmLandscapeTab::default(),
             last_export_msg: None,
             show_about: false,
+            show_command_palette: false,
+            command_palette_query: String::new(),
+            command_palette_selected: 0,
+            focus_command_palette: false,
         }
     }
 
@@ -315,7 +486,7 @@ impl BeoFoldGuiApp {
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(
-                    RichText::new("Hotkeys: Space Play/Pause | R Reset Cam | S Spin | 1-4 Tabs | F1 About")
+                    RichText::new("Hotkeys: Ctrl+K Palette | Space Play/Pause | R Reset Cam | S Spin | 1-4 Tabs | F1 About")
                         .monospace()
                         .size(10.0)
                         .color(Color32::from_rgb(120, 136, 158)),
@@ -1397,6 +1568,89 @@ impl BeoFoldGuiApp {
         }
     }
 
+    fn execute_palette_action(&mut self, action: PaletteAction, live_snap: &mut LiveFoldingState) {
+        match action {
+            PaletteAction::TabStudio3D => self.active_tab = WorkspaceTab::FoldingStudio3D,
+            PaletteAction::TabLanMatrix => self.active_tab = WorkspaceTab::LanBeowulfMatrix,
+            PaletteAction::TabWanFederation => self.active_tab = WorkspaceTab::GlobalWanFederation,
+            PaletteAction::TabMsmSurface => self.active_tab = WorkspaceTab::MsmFreeEnergyFlux,
+            PaletteAction::TogglePlayPause => {
+                let next_running = !live_snap.running;
+                live_snap.running = next_running;
+                if let Ok(mut g) = self.live_state.lock() {
+                    g.running = next_running;
+                }
+                let _ = self
+                    .sandbox_tx
+                    .send(SandboxCommand::SetRunning(next_running));
+            }
+            PaletteAction::ResetCamera => {
+                self.viewport.reset_camera();
+                self.msm_tab.reset_preview_camera();
+            }
+            PaletteAction::ToggleAutoSpin => {
+                if self.active_tab == WorkspaceTab::MsmFreeEnergyFlux {
+                    self.msm_tab.toggle_preview_auto_spin();
+                } else {
+                    self.viewport.auto_spin = !self.viewport.auto_spin;
+                }
+            }
+            PaletteAction::ToggleClusterBar => {
+                self.cluster_bar_open = !self.cluster_bar_open;
+            }
+            PaletteAction::DiscoverLanPeers => {
+                self.active_tab = WorkspaceTab::LanBeowulfMatrix;
+                self.cluster_bar_open = true;
+                spawn_one_click_mdns_scan(
+                    self.cluster_secret_input.clone(),
+                    self.wan_sync_url_input.clone(),
+                    self.net_state.clone(),
+                    self.net_targets_tx.clone(),
+                    true,
+                );
+            }
+            PaletteAction::ComputeLiveMsm => {
+                self.active_tab = WorkspaceTab::MsmFreeEnergyFlux;
+                self.msm_tab.spawn_live_ensemble_msm(live_snap);
+            }
+            PaletteAction::ExportBestPdb => match non_empty_trimmed_path(&self.export_pdb_path) {
+                Ok(out) => match live_snap.export_best_pdb(&out) {
+                    Ok(()) => {
+                        self.last_export_msg = Some(format!("Saved PDB to {}", out.display()));
+                    }
+                    Err(e) => {
+                        self.last_export_msg = Some(format!("Export failed: {}", e));
+                    }
+                },
+                Err(msg) => self.last_export_msg = Some(msg),
+            },
+            PaletteAction::ExportMsmBundle => {
+                self.active_tab = WorkspaceTab::MsmFreeEnergyFlux;
+                self.msm_tab.export_active_bundle();
+            }
+            PaletteAction::ExportMsmDiagnostics => {
+                self.active_tab = WorkspaceTab::MsmFreeEnergyFlux;
+                self.msm_tab.export_active_diagnostics();
+            }
+            PaletteAction::ToggleAbout => {
+                self.show_about = !self.show_about;
+            }
+        }
+    }
+
+    fn filtered_palette_commands(&self) -> Vec<&'static PaletteCommand> {
+        let mut scored: Vec<(i32, usize, &'static PaletteCommand)> = PALETTE_COMMANDS
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, cmd)| {
+                fuzzy_palette_score(&self.command_palette_query, cmd.label, cmd.keywords)
+                    .map(|sc| (sc, idx, cmd))
+            })
+            .collect();
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        scored.into_iter().map(|(_, _, cmd)| cmd).collect()
+    }
+
     pub fn render_ui(&mut self, ctx: &egui::Context) {
         let mut live_snap = self
             .live_state
@@ -1404,7 +1658,48 @@ impl BeoFoldGuiApp {
             .expect("live folding state mutex poisoned")
             .clone();
 
-        if self.show_about && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        let ctrl_k = ctx.input(|i| {
+            (i.modifiers.ctrl || i.modifiers.command || i.modifiers.mac_cmd)
+                && i.key_pressed(egui::Key::K)
+        });
+        if ctrl_k {
+            self.show_command_palette = !self.show_command_palette;
+            if self.show_command_palette {
+                self.command_palette_query.clear();
+                self.command_palette_selected = 0;
+                self.focus_command_palette = true;
+            }
+        } else if self.show_command_palette {
+            let (esc, up, down, enter) = ctx.input(|i| {
+                (
+                    i.key_pressed(egui::Key::Escape),
+                    i.key_pressed(egui::Key::ArrowUp),
+                    i.key_pressed(egui::Key::ArrowDown),
+                    i.key_pressed(egui::Key::Enter),
+                )
+            });
+            let matches = self.filtered_palette_commands();
+            if esc {
+                self.show_command_palette = false;
+            } else if !matches.is_empty() {
+                if self.command_palette_selected >= matches.len() {
+                    self.command_palette_selected = 0;
+                }
+                if up {
+                    self.command_palette_selected = self
+                        .command_palette_selected
+                        .checked_sub(1)
+                        .unwrap_or(matches.len() - 1);
+                } else if down {
+                    self.command_palette_selected =
+                        (self.command_palette_selected + 1) % matches.len();
+                } else if enter {
+                    let chosen = matches[self.command_palette_selected].action;
+                    self.show_command_palette = false;
+                    self.execute_palette_action(chosen, &mut live_snap);
+                }
+            }
+        } else if self.show_about && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.show_about = false;
         } else if !ctx.wants_keyboard_input() {
             let (f1, space, r_key, s_key, k1, k2, k3, k4) = ctx.input(|i| {
@@ -1498,6 +1793,75 @@ impl BeoFoldGuiApp {
                 });
             });
         });
+
+        if self.show_command_palette {
+            let mut chosen_action: Option<PaletteAction> = None;
+            let matches = self.filtered_palette_commands();
+            if !matches.is_empty() && self.command_palette_selected >= matches.len() {
+                self.command_palette_selected = 0;
+            }
+            egui::Window::new("Command Palette (Ctrl+K)")
+                .collapsible(false)
+                .resizable(false)
+                .fixed_size(egui::vec2(540.0, 360.0))
+                .anchor(egui::Align2::CENTER_TOP, egui::vec2(0.0, 68.0))
+                .show(ctx, |ui| {
+                    let edit = ui.add(
+                        egui::TextEdit::singleline(&mut self.command_palette_query)
+                            .hint_text("Type a view, MSM diagnostic, cluster action, or export...")
+                            .desired_width(f32::INFINITY),
+                    );
+                    if self.focus_command_palette {
+                        edit.request_focus();
+                        self.focus_command_palette = false;
+                    }
+                    if edit.changed() {
+                        self.command_palette_selected = 0;
+                    }
+                    ui.label(
+                        RichText::new("Up/Down: navigate • Enter: run • Esc: close")
+                            .monospace()
+                            .size(10.5)
+                            .color(Color32::from_rgb(148, 163, 184)),
+                    );
+                    ui.separator();
+                    egui::ScrollArea::vertical().max_height(265.0).show(ui, |ui| {
+                        if matches.is_empty() {
+                            ui.label(
+                                RichText::new("No matching commands.")
+                                    .monospace()
+                                    .color(Color32::from_rgb(148, 163, 184)),
+                            );
+                        } else {
+                            for (idx, cmd) in matches.iter().enumerate() {
+                                let selected = idx == self.command_palette_selected;
+                                let row_text = if cmd.hotkey.is_empty() {
+                                    format!("[{:<10}] {}", cmd.category, cmd.label)
+                                } else {
+                                    format!(
+                                        "[{:<10}] {}   ({})",
+                                        cmd.category, cmd.label, cmd.hotkey
+                                    )
+                                };
+                                let resp = ui.selectable_label(
+                                    selected,
+                                    RichText::new(row_text).monospace().size(11.5),
+                                );
+                                if resp.hovered() {
+                                    self.command_palette_selected = idx;
+                                }
+                                if resp.clicked() {
+                                    chosen_action = Some(cmd.action);
+                                }
+                            }
+                        }
+                    });
+                });
+            if let Some(act) = chosen_action {
+                self.show_command_palette = false;
+                self.execute_palette_action(act, &mut live_snap);
+            }
+        }
 
         if self.show_about {
             egui::Window::new("About BeoFold")
@@ -1769,5 +2133,58 @@ mod tests {
         });
         assert_eq!(app.active_tab, WorkspaceTab::FoldingStudio3D);
         assert!(!app.live_state.lock().unwrap().running);
+    }
+
+    #[test]
+    fn ctrl_k_command_palette_filters_navigates_and_executes_headlessly() {
+        let ctx = egui::Context::default();
+        let mut app = BeoFoldGuiApp::new_with_ctx(
+            &ctx,
+            GuiLaunchConfig {
+                lan_peer: String::new(),
+                cluster_secret: "test".to_string(),
+                sync_url: String::new(),
+                vault_dir: "./beofold_data".to_string(),
+                use_gpu: false,
+            },
+        );
+        assert!(!app.show_command_palette);
+        assert!(fuzzy_palette_score("msm", "Switch to MSM Free-Energy & Flux Surface", "msm").is_some());
+        assert!(fuzzy_palette_score("zzzz", "Reset 3D Camera", "camera").is_none());
+
+        let send_key = |app: &mut BeoFoldGuiApp, key: egui::Key, ctrl: bool| {
+            let mods = if ctrl {
+                egui::Modifiers::CTRL
+            } else {
+                egui::Modifiers::NONE
+            };
+            let mut raw = egui::RawInput::default();
+            raw.screen_rect = Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 800.0),
+            ));
+            raw.modifiers = mods;
+            raw.events.push(egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: mods,
+            });
+            let _ = ctx.run(raw, |c| app.render_ui(c));
+        };
+
+        send_key(&mut app, egui::Key::K, true);
+        assert!(app.show_command_palette);
+
+        app.command_palette_query = "msm free-energy".to_string();
+        send_key(&mut app, egui::Key::Enter, false);
+        assert!(!app.show_command_palette);
+        assert_eq!(app.active_tab, WorkspaceTab::MsmFreeEnergyFlux);
+
+        send_key(&mut app, egui::Key::K, true);
+        assert!(app.show_command_palette);
+        send_key(&mut app, egui::Key::Escape, false);
+        assert!(!app.show_command_palette);
     }
 }

@@ -207,23 +207,30 @@ async fn rpc_query_state(
         AuthenticatedLanFrame::seal_request(mac_key, gui_pubkey, &LanRpcRequest::QueryClusterState)
             .map_err(|e| e.to_string())?;
 
-    let need_reconnect = match cached_conn {
-        Some((prev_addr, ref conn)) => *prev_addr != addr || conn.close_reason().is_some(),
-        None => true,
+    let conn = if let Some((prev_addr, ref conn)) = *cached_conn {
+        if prev_addr == addr && conn.close_reason().is_none() {
+            Some(conn.clone())
+        } else {
+            None
+        }
+    } else {
+        None
     };
 
-    if need_reconnect {
-        let connecting = ep
-            .connect(addr, "beofold.local")
-            .map_err(|e| e.to_string())?;
-        let conn = tokio::time::timeout(Duration::from_millis(1800), connecting)
-            .await
-            .map_err(|_| format!("QUIC connect timeout to {}", addr))?
-            .map_err(|e| e.to_string())?;
-        *cached_conn = Some((addr, conn));
-    }
-
-    let conn = cached_conn.as_ref().unwrap().1.clone();
+    let conn = match conn {
+        Some(c) => c,
+        None => {
+            let connecting = ep
+                .connect(addr, "beofold.local")
+                .map_err(|e| e.to_string())?;
+            let c = tokio::time::timeout(Duration::from_millis(1800), connecting)
+                .await
+                .map_err(|_| format!("QUIC connect timeout to {}", addr))?
+                .map_err(|e| e.to_string())?;
+            *cached_conn = Some((addr, c.clone()));
+            c
+        }
+    };
     let (mut send, mut recv) = tokio::time::timeout(Duration::from_millis(1500), conn.open_bi())
         .await
         .map_err(|_| "QUIC stream open timeout".to_string())?
